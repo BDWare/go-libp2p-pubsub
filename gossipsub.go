@@ -13,7 +13,7 @@ import (
 	"github.com/libp2p/go-libp2p-core/peer"
 	"github.com/libp2p/go-libp2p-core/peerstore"
 	"github.com/libp2p/go-libp2p-core/protocol"
-	"github.com/libp2p/go-libp2p-core/routing"
+	"github.com/libp2p/go-libp2p-core/record"
 )
 
 const (
@@ -93,7 +93,7 @@ type GossipSubRouter struct {
 
 type connectInfo struct {
 	p   peer.ID
-	srr *routing.SignedRoutingState
+	spr *record.Envelope
 }
 
 func (gs *GossipSubRouter) Protocols() []protocol.ID {
@@ -306,22 +306,27 @@ func (gs *GossipSubRouter) pxConnect(peers []*pb.PeerInfo) {
 			continue
 		}
 
-		var srr *routing.SignedRoutingState
-		var err error
-		if pi.SignedAddrs != nil {
+		var spr *record.Envelope
+		if pi.SignedPeerRecord != nil {
 			// the peer sent us a signed record; ensure that it is valid
-			srr, err = routing.UnmarshalSignedRoutingState(pi.SignedAddrs)
+			envelope, r, err := record.ConsumeEnvelope(pi.SignedPeerRecord, peer.PeerRecordEnvelopeDomain)
 			if err != nil {
-				log.Warningf("error unmarshalling routing record obtained through px: %s", err)
+				log.Warningf("error unmarshalling peer record obtained through px: %s", err)
 				continue
 			}
-			if srr.PeerID != p {
-				log.Warningf("bogus routing record obtained through px: peer ID %s doesn't match expected peer %s", srr.PeerID, p)
+			rec, ok := r.(*peer.PeerRecord)
+			if !ok {
+				log.Warningf("bogus peer record obtained through px: envelope payload is not PeerRecord")
 				continue
 			}
+			if rec.PeerID != p {
+				log.Warningf("bogus peer record obtained through px: peer ID %s doesn't match expected peer %s", rec.PeerID, p)
+				continue
+			}
+			spr = envelope
 		}
 
-		toconnect = append(toconnect, connectInfo{p, srr})
+		toconnect = append(toconnect, connectInfo{p, spr})
 	}
 
 	if len(toconnect) == 0 {
@@ -347,8 +352,12 @@ func (gs *GossipSubRouter) connector() {
 			}
 
 			log.Debugf("connecting to %s", ci.p)
-			if ci.srr != nil {
-				gs.p.host.Peerstore().AddCertifiedAddrs(ci.srr, peerstore.TempAddrTTL)
+			cab, ok := peerstore.GetCertifiedAddrBook(gs.p.host.Peerstore())
+			if ok && ci.spr != nil {
+				_, err := cab.ConsumePeerRecord(ci.spr, peerstore.TempAddrTTL)
+				if err != nil {
+					log.Debugf("error processing peer record: %s", err)
+				}
 			}
 
 			ctx, cancel := context.WithTimeout(gs.p.ctx, GossipSubConnectionTimeout)
@@ -822,21 +831,24 @@ func (gs *GossipSubRouter) makePrune(p peer.ID, topic string) *pb.ControlPrune {
 		return p != xp
 	})
 
+	cab, ok := peerstore.GetCertifiedAddrBook(gs.p.host.Peerstore())
 	px := make([]*pb.PeerInfo, 0, len(peers))
 	for _, p := range peers {
-		// see if we have a signed address record to send back; if we don't, just send
+		// see if we have a signed peer record to send back; if we don't, just send
 		// the peer ID and let the pruned peer find them in the DHT -- we can't trust
 		// unsigned address records through px anyway.
-		srr := gs.p.host.Peerstore().SignedRoutingState(p)
-		var saddrs []byte
-		var err error
-		if srr != nil {
-			saddrs, err = srr.Marshal()
-			if err != nil {
-				log.Warningf("error marshaling signed routing state for %s: %s", p, err)
+		var recordBytes []byte
+		if ok {
+			spr := cab.GetPeerRecord(p)
+			var err error
+			if spr != nil {
+				recordBytes, err = spr.Marshal()
+				if err != nil {
+					log.Warningf("error marshaling signed peer record for %s: %s", p, err)
+				}
 			}
 		}
-		px = append(px, &pb.PeerInfo{PeerID: []byte(p), SignedAddrs: saddrs})
+		px = append(px, &pb.PeerInfo{PeerID: []byte(p), SignedPeerRecord: recordBytes})
 	}
 
 	return &pb.ControlPrune{TopicID: &topic, Peers: px}
