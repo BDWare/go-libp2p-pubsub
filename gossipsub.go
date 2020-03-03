@@ -475,8 +475,8 @@ func (gs *GossipSubRouter) connector() {
 	}
 }
 
-func (gs *GossipSubRouter) Publish(from peer.ID, msg *pb.Message) {
-	gs.mcache.Put(msg)
+func (gs *GossipSubRouter) Publish(from peer.ID, msg *Message) {
+	gs.mcache.Put(msg.Message)
 
 	tosend := make(map[peer.ID]struct{})
 	for _, topic := range msg.GetTopicIDs() {
@@ -486,7 +486,7 @@ func (gs *GossipSubRouter) Publish(from peer.ID, msg *pb.Message) {
 			continue
 		}
 
-		if gs.floodPublish {
+		if gs.floodPublish && msg.ReceivedFrom == gs.p.host.ID() {
 			for p := range tmap {
 				if gs.score.Score(p) >= gs.publishThreshold {
 					tosend[p] = struct{}{}
@@ -526,7 +526,7 @@ func (gs *GossipSubRouter) Publish(from peer.ID, msg *pb.Message) {
 		}
 	}
 
-	out := rpcWithMessages(msg)
+	out := rpcWithMessages(msg.Message)
 	for pid := range tosend {
 		if pid == from || pid == peer.ID(msg.GetFrom()) {
 			continue
