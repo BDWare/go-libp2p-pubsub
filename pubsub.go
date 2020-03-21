@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"math/rand"
 	"sync"
 	"sync/atomic"
@@ -22,9 +23,6 @@ import (
 	logging "github.com/ipfs/go-log"
 	timecache "github.com/whyrusleeping/timecache"
 )
-
-// DefaultMaximumMessageSize is 1mb.
-const DefaultMaxMessageSize = 1 << 20
 
 var (
 	TimeCacheDuration = 120 * time.Second
@@ -51,9 +49,7 @@ type PubSub struct {
 
 	tracer *pubsubTracer
 
-	// maxMessageSize is the maximum message size; it applies globally to all
-	// topics.
-	maxMessageSize int
+	collectorNotifiee CollectorNotifiee
 
 	// size of the outbound message channel that we maintain for each peer
 	peerOutboundQueueSize int
@@ -124,9 +120,6 @@ type PubSub struct {
 	seenMessagesMx sync.Mutex
 	seenMessages   *timecache.TimeCache
 
-	// function used to compute the ID for a message
-	msgID MsgIdFunction
-
 	// key for signing messages; nil when signing is disabled (default for now)
 	signKey crypto.PrivKey
 	// source ID for signed messages; corresponds to signKey
@@ -164,10 +157,19 @@ type PubSubRouter interface {
 	Leave(topic string)
 }
 
+// NotifiableRouter is a temporary interface to notify plumrouter
+type NotifiableRouter interface {
+	PubSubRouter
+	// OnPeerJoin is a temporary interface to notify router that a new peer subscribes a topic
+	OnPeerJoin(topic string, pid peer.ID)
+	// OnPeerLeave is a temporary interface to notify router that a new peer unsubscribes a topic
+	OnPeerLeave(topic string, pid peer.ID)
+}
+
 type Message struct {
 	*pb.Message
-	ReceivedFrom  peer.ID
-	ValidatorData interface{}
+	ReceivedFrom peer.ID
+	VaidatorData interface{}
 }
 
 func (m *Message) GetFrom() peer.ID {
@@ -191,7 +193,7 @@ func NewPubSub(ctx context.Context, h host.Host, rt PubSubRouter, opts ...Option
 		rt:                    rt,
 		val:                   newValidation(),
 		disc:                  &discover{},
-		maxMessageSize:        DefaultMaxMessageSize,
+		collectorNotifiee:     &emptyNotifiee{},
 		peerOutboundQueueSize: 32,
 		signID:                h.ID(),
 		signKey:               h.Peerstore().PrivKey(h.ID()),
@@ -219,7 +221,6 @@ func NewPubSub(ctx context.Context, h host.Host, rt PubSubRouter, opts ...Option
 		blacklist:             NewMapBlacklist(),
 		blacklistPeer:         make(chan peer.ID),
 		seenMessages:          timecache.NewTimeCache(TimeCacheDuration),
-		msgID:                 DefaultMsgIdFn,
 		counter:               uint64(time.Now().UnixNano()),
 	}
 
@@ -250,24 +251,6 @@ func NewPubSub(ctx context.Context, h host.Host, rt PubSubRouter, opts ...Option
 	go ps.processLoop(ctx)
 
 	return ps, nil
-}
-
-// MsgIdFunction returns a unique ID for the passed Message, and PubSub can be customized to use any
-// implementation of this function by configuring it with the Option from WithMessageIdFn.
-type MsgIdFunction func(pmsg *pb.Message) string
-
-// WithMessageIdFn is an option to customize the way a message ID is computed for a pubsub message.
-// The default ID function is DefaultMsgIdFn (concatenate source and seq nr.),
-// but it can be customized to e.g. the hash of the message.
-func WithMessageIdFn(fn MsgIdFunction) Option {
-	return func(p *PubSub) error {
-		p.msgID = fn
-		// the tracer Option may already be set. Update its message ID function to make options order-independent.
-		if p.tracer != nil {
-			p.tracer.msgID = fn
-		}
-		return nil
-	}
 }
 
 // WithPeerOutboundQueueSize is an option to set the buffer size for outbound messages to a peer
@@ -356,35 +339,7 @@ func WithDiscovery(d discovery.Discovery, opts ...DiscoverOpt) Option {
 // WithEventTracer provides a tracer for the pubsub system
 func WithEventTracer(tracer EventTracer) Option {
 	return func(p *PubSub) error {
-		p.tracer = &pubsubTracer{tracer: tracer, pid: p.host.ID(), msgID: p.msgID}
-		return nil
-	}
-}
-
-// WithMaxMessageSize sets the global maximum message size for pubsub wire
-// messages. The default value is 1MiB (DefaultMaxMessageSize).
-//
-// Observe the following warnings when setting this option.
-//
-// WARNING #1: Make sure to change the default protocol prefixes for floodsub
-// (FloodSubID) and gossipsub (GossipSubID). This avoids accidentally joining
-// the public default network, which uses the default max message size, and
-// therefore will cause messages to be dropped.
-//
-// WARNING #2: Reducing the default max message limit is fine, if you are
-// certain that your application messages will not exceed the new limit.
-// However, be wary of increasing the limit, as pubsub networks are naturally
-// write-amplifying, i.e. for every message we receive, we send D copies of the
-// message to our peers. If those messages are large, the bandwidth requirements
-// will grow linearly. Note that propagation is sent on the uplink, which
-// traditionally is more constrained than the downlink. Instead, consider
-// out-of-band retrieval for large messages, by sending a CID (Content-ID) or
-// another type of locator, such that messages can be fetched on-demand, rather
-// than being pushed proactively. Under this design, you'd use the pubsub layer
-// as a signalling system, rather than a data delivery system.
-func WithMaxMessageSize(maxMessageSize int) Option {
-	return func(ps *PubSub) error {
-		ps.maxMessageSize = maxMessageSize
+		p.tracer = &pubsubTracer{tracer: tracer, pid: p.host.ID()}
 		return nil
 	}
 }
@@ -740,6 +695,9 @@ func (p *PubSub) subscribedToMsg(msg *pb.Message) bool {
 func (p *PubSub) notifyLeave(topic string, pid peer.ID) {
 	if t, ok := p.myTopics[topic]; ok {
 		t.sendNotification(PeerEvent{PeerLeave, pid})
+		if rt, ok := p.rt.(NotifiableRouter); ok {
+			rt.OnPeerLeave(topic, pid)
+		}
 	}
 }
 
@@ -760,6 +718,9 @@ func (p *PubSub) handleIncomingRPC(rpc *RPC) {
 				if topic, ok := p.myTopics[t]; ok {
 					peer := rpc.from
 					topic.sendNotification(PeerEvent{PeerJoin, peer})
+					if rt, ok := p.rt.(NotifiableRouter); ok {
+						rt.OnPeerJoin(t, peer)
+					}
 				}
 			}
 		} else {
@@ -788,8 +749,8 @@ func (p *PubSub) handleIncomingRPC(rpc *RPC) {
 	p.rt.HandleRPC(rpc)
 }
 
-// DefaultMsgIdFn returns a unique ID of the passed Message
-func DefaultMsgIdFn(pmsg *pb.Message) string {
+// msgID returns a unique ID of the passed Message
+func msgID(pmsg *pb.Message) string {
 	return string(pmsg.GetFrom()) + string(pmsg.GetSeqno())
 }
 
@@ -818,7 +779,7 @@ func (p *PubSub) pushMsg(msg *Message) {
 	}
 
 	// have we already seen and validated this message?
-	id := p.msgID(msg.Message)
+	id := msgID(msg.Message)
 	if p.seenMessage(id) {
 		p.tracer.DuplicateMessage(msg)
 		return
@@ -1046,3 +1007,58 @@ func (p *PubSub) UnregisterTopicValidator(topic string) error {
 	}
 	return <-rmVal.resp
 }
+
+// GetForwardFrom .
+func (p *PubSub) GetForwardFrom(msg *pb.Message) (peer.ID, error) {
+	rt, ok := p.rt.(*RoutablePlumRouter)
+	if !ok {
+		return "", ErrUnsupportRouter
+	}
+	return rt.GetForwardFrom(msg)
+}
+
+// GetForwardTo .
+func (p *PubSub) GetForwardTo(msg *pb.Message) ([]peer.ID, error) {
+	rt, ok := p.rt.(*RoutablePlumRouter)
+	if !ok {
+		return []peer.ID{}, ErrUnsupportRouter
+	}
+	return rt.GetForwardTo(msg)
+}
+
+// PrintRoute prints route for reactivePlumRouter
+func (p *PubSub) PrintRoute(wr io.Writer) error {
+	rt, ok := p.rt.(*RoutablePlumRouter)
+	if !ok {
+		return ErrUnsupportRouter
+	}
+	rt.Fprint(wr)
+	return nil
+}
+
+type CollectorNotifiee interface {
+	OnRecvUnseenMessage(from peer.ID, msg *pb.Message)
+	OnRecvSeenMessage(from peer.ID, msg *pb.Message)
+	OnHaveSentMessage(to peer.ID, msg *pb.Message)
+	OnHaveSentAll(msg *pb.Message)
+	OnPeerDown(p peer.ID)
+}
+
+func WithCollectorNotifiee(notif CollectorNotifiee) Option {
+	return func(p *PubSub) error {
+		p.collectorNotifiee = notif
+		return nil
+	}
+}
+
+func (p *PubSub) SetCollectorNotifiee(notif CollectorNotifiee) {
+	WithCollectorNotifiee(notif)(p)
+}
+
+type emptyNotifiee struct{}
+
+func (e *emptyNotifiee) OnRecvUnseenMessage(from peer.ID, msg *pb.Message) {}
+func (e *emptyNotifiee) OnRecvSeenMessage(from peer.ID, msg *pb.Message)   {}
+func (e *emptyNotifiee) OnHaveSentMessage(to peer.ID, msg *pb.Message)     {}
+func (e *emptyNotifiee) OnHaveSentAll(msg *pb.Message)                     {}
+func (e *emptyNotifiee) OnPeerDown(p peer.ID)                              {}

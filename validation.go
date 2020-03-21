@@ -10,7 +10,6 @@ import (
 )
 
 const (
-	defaultValidateQueueSize   = 32
 	defaultValidateConcurrency = 1024
 	defaultValidateThrottle    = 8192
 )
@@ -83,7 +82,7 @@ type rmValReq struct {
 func newValidation() *validation {
 	return &validation{
 		topicVals:        make(map[string]*topicVal),
-		validateQ:        make(chan *validateReq, defaultValidateQueueSize),
+		validateQ:        make(chan *validateReq, 32),
 		validateThrottle: make(chan struct{}, defaultValidateThrottle),
 		validateWorkers:  runtime.NumCPU(),
 	}
@@ -202,7 +201,7 @@ func (v *validation) validate(vals []*topicVal, src peer.ID, msg *Message) {
 
 	// we can mark the message as seen now that we have verified the signature
 	// and avoid invoking user validators more than once
-	id := v.p.msgID(msg.Message)
+	id := msgID(msg.Message)
 	if !v.p.markSeen(id) {
 		v.tracer.DuplicateMessage(msg)
 		return
@@ -342,18 +341,6 @@ func (val *topicVal) validateMsg(ctx context.Context, src peer.ID, msg *Message)
 }
 
 /// Options
-
-// WithValidateQueueSize sets the buffer of validate queue. Defaults to 32.
-// When queue is full, validation is throttled and new messages are dropped.
-func WithValidateQueueSize(n int) Option {
-	return func(ps *PubSub) error {
-		if n > 0 {
-			ps.val.validateQ = make(chan *validateReq, n)
-			return nil
-		}
-		return fmt.Errorf("validate queue size must be > 0")
-	}
-}
 
 // WithValidateThrottle sets the upper bound on the number of active validation
 // goroutines across all topics. The default is 8192.

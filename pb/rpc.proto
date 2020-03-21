@@ -28,11 +28,13 @@ message ControlMessage {
 	repeated ControlIWant iwant = 2;
 	repeated ControlGraft graft = 3;
 	repeated ControlPrune prune = 4;
+	repeated uint32 rounds = 5;
 }
 
 message ControlIHave {
 	optional string topicID = 1;
 	repeated string messageIDs = 2;
+	optional uint32 round = 3;
 }
 
 message ControlIWant {
@@ -41,6 +43,8 @@ message ControlIWant {
 
 message ControlGraft {
 	optional string topicID = 1;
+	repeated string messageIDs = 2;
+	optional uint32 round = 3;
 }
 
 message ControlPrune {

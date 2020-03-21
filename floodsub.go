@@ -49,6 +49,7 @@ func (fs *FloodSubRouter) AddPeer(p peer.ID, proto protocol.ID) {
 
 func (fs *FloodSubRouter) RemovePeer(p peer.ID) {
 	fs.tracer.RemovePeer(p)
+	fs.p.collectorNotifiee.OnPeerDown(p)
 }
 
 func (fs *FloodSubRouter) EnoughPeers(topic string, suggested int) bool {
@@ -69,9 +70,18 @@ func (fs *FloodSubRouter) EnoughPeers(topic string, suggested int) bool {
 	return false
 }
 
-func (fs *FloodSubRouter) HandleRPC(rpc *RPC) {}
+func (fs *FloodSubRouter) HandleRPC(rpc *RPC) {
+	from := rpc.from
+	msgs := rpc.GetPublish()
+	for _, msg := range msgs {
+		if fs.p.seenMessage(msgID(msg)) {
+			fs.p.collectorNotifiee.OnRecvSeenMessage(from, msg)
+		}
+	}
+}
 
 func (fs *FloodSubRouter) Publish(from peer.ID, msg *pb.Message) {
+	fs.p.collectorNotifiee.OnRecvUnseenMessage(from, msg)
 	tosend := make(map[peer.ID]struct{})
 	for _, topic := range msg.GetTopicIDs() {
 		tmap, ok := fs.p.topics[topic]
@@ -98,12 +108,14 @@ func (fs *FloodSubRouter) Publish(from peer.ID, msg *pb.Message) {
 		select {
 		case mch <- out:
 			fs.tracer.SendRPC(out, pid)
+			fs.p.collectorNotifiee.OnHaveSentMessage(pid, msg)
 		default:
 			log.Infof("dropping message to peer %s: queue full", pid)
 			fs.tracer.DropRPC(out, pid)
 			// Drop it. The peer is too slow.
 		}
 	}
+	fs.p.collectorNotifiee.OnHaveSentAll(msg)
 }
 
 func (fs *FloodSubRouter) Join(topic string) {
