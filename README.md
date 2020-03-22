@@ -42,8 +42,7 @@ See [libp2p/specs/pubsub#Implementations](https://github.com/libp2p/specs/tree/m
 ## Documentation
 
 See the [libp2p specs](https://github.com/libp2p/specs/tree/master/pubsub) for high level documentation
-and [godoc](https://godoc.org/github.com/bdware/go-libp2p-pubsub) for API documentation.
-
+and [API documentation](https://pkg.go.dev/github.com/bdware/go-libp2p-pubsub).
 
 ## Tracing
 
@@ -93,6 +92,8 @@ Small note: If editing the README, please conform to the [standard-readme](https
 Copyright for portions of this fork are held by [Jeromy Johnson, 2016] as part of the original [go-libp2p-pubsub](https://github.com/libp2p/go-libp2p-pubsub) project.
 
 All other copyright for this fork are held by [The BDWare Authors, 2020].
+
+All rights reserved.
 
 ---
 
