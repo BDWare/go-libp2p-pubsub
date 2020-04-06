@@ -1,9 +1,15 @@
 # go-libp2p-pubsub
 
-[![](https://img.shields.io/badge/made%20by-Protocol%20Labs-blue.svg?style=flat-square)](http://protocol.ai)
-[![](https://img.shields.io/badge/project-libp2p-yellow.svg?style=flat-square)](http://github.com/libp2p/libp2p)
-[![](https://img.shields.io/badge/freenode-%23libp2p-yellow.svg?style=flat-square)](http://webchat.freenode.net/?channels=%23libp2p)
-[![Discourse posts](https://img.shields.io/discourse/https/discuss.libp2p.io/posts.svg)](https://discuss.libp2p.io)
+<p align="left">
+  <a href="http://protocol.ai"><img src="https://img.shields.io/badge/made%20by-Protocol%20Labs-blue.svg?style=flat-square" /></a>
+  <a href="http://github.com/bdware"><img src="https://img.shields.io/badge/project-bdware-yellow.svg?style=flat-square" /></a>
+  <a href="https://travis-ci.com/bdware/go-libp2p-pubsub"><img src="https://img.shields.io/travis/com/bdware/go-libp2p-pubsub/master?style=flat-square"></a>
+  <a href="https://codecov.io/gh/bdware/go-libp2p-pubsub"><img src="https://img.shields.io/codecov/c/github/bdware/go-libp2p-pubsub?style=flat-square"></a>
+  <a href="https://github.com/RichardLitt/standard-readme"><img src="https://img.shields.io/badge/readme%20style-standard-brightgreen.svg?style=flat-square" /></a>
+  <a href="https://pkg.go.dev/github.com/bdware/go-libp2p-pubsub"><img src="http://img.shields.io/badge/godoc-reference-5272B4.svg?style=flat-square" /></a>
+  <a href=""><img src="https://img.shields.io/badge/golang-%3E%3D1.14.0-orange.svg?style=flat-square" /></a>
+  <br>
+</p>
 
 This repo contains the canonical pubsub implementation for libp2p. We currently provide three message router options:
 - Floodsub, which is the baseline flooding protocol.
@@ -37,6 +43,11 @@ This repo contains the canonical pubsub implementation for libp2p. We currently 
 
 ```
 go get github.com/bdware/go-libp2p-pubsub
+```
+
+Add the following line to your go.mod:
+```
+replace github.com/libp2p/go-libp2p-pubsub => github.com/bdware/go-libp2p-pubsub {{PUBSUB_VERSION}}
 ```
 
 ## Usage
