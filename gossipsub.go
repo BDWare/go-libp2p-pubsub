@@ -9,12 +9,16 @@ import (
 	pb "github.com/libp2p/go-libp2p-pubsub/pb"
 
 	"github.com/libp2p/go-libp2p-core/host"
+	"github.com/libp2p/go-libp2p-core/network"
 	"github.com/libp2p/go-libp2p-core/peer"
+	"github.com/libp2p/go-libp2p-core/peerstore"
 	"github.com/libp2p/go-libp2p-core/protocol"
+	"github.com/libp2p/go-libp2p-core/record"
 )
 
 const (
-	GossipSubID = protocol.ID("/meshsub/1.0.0")
+	GossipSubID_v10 = protocol.ID("/meshsub/1.0.0")
+	GossipSubID_v11 = protocol.ID("/meshsub/1.1.0")
 )
 
 var (
@@ -33,6 +37,21 @@ var (
 
 	// fanout ttl
 	GossipSubFanoutTTL = 60 * time.Second
+
+	// number of peers to include in prune Peer eXchange
+	GossipSubPrunePeers = 16
+
+	// backoff time for pruned peers
+	GossipSubPruneBackoff = time.Minute
+
+	// number of active connection attempts for peers obtained through px
+	GossipSubConnectors = 16
+
+	// maximum number of pending connections for peers attempted through px
+	GossipSubMaxPendingConnections = 1024
+
+	// timeout for connection attempts
+	GossipSubConnectionTimeout = 30 * time.Second
 )
 
 // NewGossipSub returns a new PubSub object using GossipSubRouter as the router.
@@ -44,6 +63,8 @@ func NewGossipSub(ctx context.Context, h host.Host, opts ...Option) (*PubSub, er
 		lastpub: make(map[string]int64),
 		gossip:  make(map[peer.ID][]*pb.ControlIHave),
 		control: make(map[peer.ID]*pb.ControlMessage),
+		backoff: make(map[string]map[peer.ID]time.Time),
+		connect: make(chan connectInfo, GossipSubMaxPendingConnections),
 		mcache:  NewMessageCache(GossipSubHistoryGossip, GossipSubHistoryLength),
 	}
 	return NewPubSub(ctx, h, rt, opts...)
@@ -58,18 +79,25 @@ func NewGossipSub(ctx context.Context, h host.Host, opts ...Option) (*PubSub, er
 // messages to their topic for GossipSubFanoutTTL.
 type GossipSubRouter struct {
 	p       *PubSub
-	peers   map[peer.ID]protocol.ID         // peer protocols
-	mesh    map[string]map[peer.ID]struct{} // topic meshes
-	fanout  map[string]map[peer.ID]struct{} // topic fanout
-	lastpub map[string]int64                // last publish time for fanout topics
-	gossip  map[peer.ID][]*pb.ControlIHave  // pending gossip
-	control map[peer.ID]*pb.ControlMessage  // pending control messages
+	peers   map[peer.ID]protocol.ID          // peer protocols
+	mesh    map[string]map[peer.ID]struct{}  // topic meshes
+	fanout  map[string]map[peer.ID]struct{}  // topic fanout
+	lastpub map[string]int64                 // last publish time for fanout topics
+	gossip  map[peer.ID][]*pb.ControlIHave   // pending gossip
+	control map[peer.ID]*pb.ControlMessage   // pending control messages
+	backoff map[string]map[peer.ID]time.Time // prune backoff
+	connect chan connectInfo                 // px connection requests
 	mcache  *MessageCache
 	tracer  *pubsubTracer
 }
 
+type connectInfo struct {
+	p   peer.ID
+	spr *record.Envelope
+}
+
 func (gs *GossipSubRouter) Protocols() []protocol.ID {
-	return []protocol.ID{GossipSubID, FloodSubID}
+	return []protocol.ID{GossipSubID_v11, GossipSubID_v10, FloodSubID}
 }
 
 func (gs *GossipSubRouter) Attach(p *PubSub) {
@@ -78,6 +106,9 @@ func (gs *GossipSubRouter) Attach(p *PubSub) {
 	// start using the same msg ID function as PubSub for caching messages.
 	gs.mcache.SetMsgIdFn(p.msgID)
 	go gs.heartbeatTimer()
+	for i := 0; i < GossipSubConnectors; i++ {
+		go gs.connector()
+	}
 }
 
 func (gs *GossipSubRouter) AddPeer(p peer.ID, proto protocol.ID) {
@@ -226,7 +257,7 @@ func (gs *GossipSubRouter) handleGraft(p peer.ID, ctl *pb.ControlMessage) []*pb.
 
 	cprune := make([]*pb.ControlPrune, 0, len(prune))
 	for _, topic := range prune {
-		cprune = append(cprune, &pb.ControlPrune{TopicID: &topic})
+		cprune = append(cprune, gs.makePrune(p, topic))
 	}
 
 	return cprune
@@ -241,6 +272,103 @@ func (gs *GossipSubRouter) handlePrune(p peer.ID, ctl *pb.ControlMessage) {
 			gs.tracer.Prune(p, topic)
 			delete(peers, p)
 			gs.untagPeer(p, topic)
+			gs.addBackoff(p, topic)
+			px := prune.GetPeers()
+			if len(px) > 0 {
+				gs.pxConnect(px)
+			}
+		}
+	}
+}
+
+func (gs *GossipSubRouter) addBackoff(p peer.ID, topic string) {
+	backoff, ok := gs.backoff[topic]
+	if !ok {
+		backoff = make(map[peer.ID]time.Time)
+		gs.backoff[topic] = backoff
+	}
+	backoff[p] = time.Now().Add(GossipSubPruneBackoff)
+}
+
+func (gs *GossipSubRouter) pxConnect(peers []*pb.PeerInfo) {
+	if len(peers) > GossipSubPrunePeers {
+		shufflePeerInfo(peers)
+		peers = peers[:GossipSubPrunePeers]
+	}
+
+	toconnect := make([]connectInfo, 0, len(peers))
+
+	for _, pi := range peers {
+		p := peer.ID(pi.PeerID)
+
+		_, connected := gs.peers[p]
+		if connected {
+			continue
+		}
+
+		var spr *record.Envelope
+		if pi.SignedPeerRecord != nil {
+			// the peer sent us a signed record; ensure that it is valid
+			envelope, r, err := record.ConsumeEnvelope(pi.SignedPeerRecord, peer.PeerRecordEnvelopeDomain)
+			if err != nil {
+				log.Warnf("error unmarshalling peer record obtained through px: %s", err)
+				continue
+			}
+			rec, ok := r.(*peer.PeerRecord)
+			if !ok {
+				log.Warnf("bogus peer record obtained through px: envelope payload is not PeerRecord")
+				continue
+			}
+			if rec.PeerID != p {
+				log.Warnf("bogus peer record obtained through px: peer ID %s doesn't match expected peer %s", rec.PeerID, p)
+				continue
+			}
+			spr = envelope
+		}
+
+		toconnect = append(toconnect, connectInfo{p, spr})
+	}
+
+	if len(toconnect) == 0 {
+		return
+	}
+
+	for _, ci := range toconnect {
+		select {
+		case gs.connect <- ci:
+		default:
+			log.Debugf("ignoring peer connection attempt; too many pending connections")
+			break
+		}
+	}
+}
+
+func (gs *GossipSubRouter) connector() {
+	for {
+		select {
+		case ci := <-gs.connect:
+			if gs.p.host.Network().Connectedness(ci.p) == network.Connected {
+				continue
+			}
+
+			log.Debugf("connecting to %s", ci.p)
+			cab, ok := peerstore.GetCertifiedAddrBook(gs.p.host.Peerstore())
+			if ok && ci.spr != nil {
+				_, err := cab.ConsumePeerRecord(ci.spr, peerstore.TempAddrTTL)
+				if err != nil {
+					log.Debugf("error processing peer record: %s", err)
+				}
+			}
+
+			ctx, cancel := context.WithTimeout(gs.p.ctx, GossipSubConnectionTimeout)
+			err := gs.p.host.Connect(ctx, peer.AddrInfo{ID: ci.p})
+			cancel()
+			if err != nil {
+				log.Debugf("error connecting to %s: %s", ci.p, err)
+			}
+
+		case <-gs.p.ctx.Done():
+			return
 		}
 	}
 }
@@ -360,7 +488,7 @@ func (gs *GossipSubRouter) sendGraft(p peer.ID, topic string) {
 }
 
 func (gs *GossipSubRouter) sendPrune(p peer.ID, topic string) {
-	prune := []*pb.ControlPrune{&pb.ControlPrune{TopicID: &topic}}
+	prune := []*pb.ControlPrune{gs.makePrune(p, topic)}
 	out := rpcWithControl(nil, nil, nil, nil, prune)
 	gs.sendRPC(p, out)
 }
@@ -443,16 +571,21 @@ func (gs *GossipSubRouter) heartbeat() {
 	tograft := make(map[peer.ID][]string)
 	toprune := make(map[peer.ID][]string)
 
+	// clean up expired backoffs
+	gs.clearBackoff()
+
 	// maintain the mesh for topics we have joined
 	for topic, peers := range gs.mesh {
 
 		// do we have enough peers?
 		if len(peers) < GossipSubDlo {
+			backoff := gs.backoff[topic]
 			ineed := GossipSubD - len(peers)
 			plst := gs.getPeers(topic, ineed, func(p peer.ID) bool {
-				// filter our current peers
-				_, ok := peers[p]
-				return !ok
+				// filter our current peers and peers we are backing off
+				_, inMesh := peers[p]
+				_, doBackoff := backoff[p]
+				return !inMesh && !doBackoff
 			})
 
 			for _, p := range plst {
@@ -531,6 +664,20 @@ func (gs *GossipSubRouter) heartbeat() {
 	gs.mcache.Shift()
 }
 
+func (gs *GossipSubRouter) clearBackoff() {
+	now := time.Now()
+	for topic, backoff := range gs.backoff {
+		for p, expire := range backoff {
+			if expire.Before(now) {
+				delete(backoff, p)
+			}
+		}
+		if len(backoff) == 0 {
+			delete(gs.backoff, topic)
+		}
+	}
+}
+
 func (gs *GossipSubRouter) sendGraftPrune(tograft, toprune map[peer.ID][]string) {
 	for p, topics := range tograft {
 		graft := make([]*pb.ControlGraft, 0, len(topics))
@@ -544,7 +691,7 @@ func (gs *GossipSubRouter) sendGraftPrune(tograft, toprune map[peer.ID][]string)
 			delete(toprune, p)
 			prune = make([]*pb.ControlPrune, 0, len(pruning))
 			for _, topic := range pruning {
-				prune = append(prune, &pb.ControlPrune{TopicID: &topic})
+				prune = append(prune, gs.makePrune(p, topic))
 			}
 		}
 
@@ -555,7 +702,7 @@ func (gs *GossipSubRouter) sendGraftPrune(tograft, toprune map[peer.ID][]string)
 	for p, topics := range toprune {
 		prune := make([]*pb.ControlPrune, 0, len(topics))
 		for _, topic := range topics {
-			prune = append(prune, &pb.ControlPrune{TopicID: &topic})
+			prune = append(prune, gs.makePrune(p, topic))
 		}
 
 		out := rpcWithControl(nil, nil, nil, nil, prune)
@@ -673,6 +820,40 @@ func (gs *GossipSubRouter) piggybackControl(p peer.ID, out *RPC, ctl *pb.Control
 	}
 }
 
+func (gs *GossipSubRouter) makePrune(p peer.ID, topic string) *pb.ControlPrune {
+	if gs.peers[p] == GossipSubID_v10 {
+		// GossipSub v1.0 -- no peer exchange, the peer won't be able to parse it anyway
+		return &pb.ControlPrune{TopicID: &topic}
+	}
+
+	// select peers for Peer eXchange
+	peers := gs.getPeers(topic, GossipSubPrunePeers, func(xp peer.ID) bool {
+		return p != xp
+	})
+
+	cab, ok := peerstore.GetCertifiedAddrBook(gs.p.host.Peerstore())
+	px := make([]*pb.PeerInfo, 0, len(peers))
+	for _, p := range peers {
+		// see if we have a signed peer record to send back; if we don't, just send
+		// the peer ID and let the pruned peer find them in the DHT -- we can't trust
+		// unsigned address records through px anyway.
+		var recordBytes []byte
+		if ok {
+			spr := cab.GetPeerRecord(p)
+			var err error
+			if spr != nil {
+				recordBytes, err = spr.Marshal()
+				if err != nil {
+					log.Warnf("error marshaling signed peer record for %s: %s", p, err)
+				}
+			}
+		}
+		px = append(px, &pb.PeerInfo{PeerID: []byte(p), SignedPeerRecord: recordBytes})
+	}
+
+	return &pb.ControlPrune{TopicID: &topic, Peers: px}
+}
+
 func (gs *GossipSubRouter) getPeers(topic string, count int, filter func(peer.ID) bool) []peer.ID {
 	tmap, ok := gs.p.topics[topic]
 	if !ok {
@@ -681,7 +862,7 @@ func (gs *GossipSubRouter) getPeers(topic string, count int, filter func(peer.ID
 
 	peers := make([]peer.ID, 0, len(tmap))
 	for p := range tmap {
-		if gs.peers[p] == GossipSubID && filter(p) {
+		if (gs.peers[p] == GossipSubID_v10 || gs.peers[p] == GossipSubID_v11) && filter(p) {
 			peers = append(peers, p)
 		}
 	}
@@ -726,6 +907,13 @@ func peerMapToList(peers map[peer.ID]struct{}) []peer.ID {
 }
 
 func shufflePeers(peers []peer.ID) {
+	for i := range peers {
+		j := rand.Intn(i + 1)
+		peers[i], peers[j] = peers[j], peers[i]
+	}
+}
+
+func shufflePeerInfo(peers []*pb.PeerInfo) {
 	for i := range peers {
 		j := rand.Intn(i + 1)
 		peers[i], peers[j] = peers[j], peers[i]
