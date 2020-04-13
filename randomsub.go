@@ -2,6 +2,7 @@ package pubsub
 
 import (
 	"context"
+	"fmt"
 
 	pb "github.com/libp2p/go-libp2p-pubsub/pb"
 
@@ -14,6 +15,7 @@ const (
 	RandomSubID = protocol.ID("/randomsub/1.0.0")
 )
 
+// RandomSubD is the default number of peers to be forwarded.
 var (
 	RandomSubD = 6
 )
@@ -22,6 +24,7 @@ var (
 func NewRandomSub(ctx context.Context, h host.Host, opts ...Option) (*PubSub, error) {
 	rt := &RandomSubRouter{
 		peers: make(map[peer.ID]protocol.ID),
+		gen:   DefaultRandomSubDGenerator,
 	}
 	return NewPubSub(ctx, h, rt, opts...)
 }
@@ -32,6 +35,7 @@ type RandomSubRouter struct {
 	p      *PubSub
 	peers  map[peer.ID]protocol.ID
 	tracer *pubsubTracer
+	gen    RandomSubDGenerator
 }
 
 func (rs *RandomSubRouter) Protocols() []protocol.ID {
@@ -114,10 +118,13 @@ func (rs *RandomSubRouter) Publish(from peer.ID, msg *pb.Message) {
 		}
 	}
 
-	if len(rspeers) > RandomSubD {
+	// get randomSubD for each massage
+	randomSubD := rs.gen(msg)
+
+	if len(rspeers) > randomSubD {
 		xpeers := peerMapToList(rspeers)
 		shufflePeers(xpeers)
-		xpeers = xpeers[:RandomSubD]
+		xpeers = xpeers[:randomSubD]
 		for _, p := range xpeers {
 			tosend[p] = struct{}{}
 		}
@@ -150,4 +157,29 @@ func (rs *RandomSubRouter) Join(topic string) {
 
 func (rs *RandomSubRouter) Leave(topic string) {
 	rs.tracer.Join(topic)
+}
+
+// RandomSubDGenerator is the function that controls how many peers to be forwarded.
+type RandomSubDGenerator func(msg *pb.Message) int
+
+// DefaultRandomSubDGenerator returns the default RandomSubD
+func DefaultRandomSubDGenerator(msg *pb.Message) int {
+	return RandomSubD
+}
+
+// WithRandomSubDGenerator is the option that changes randomSubDGenerator
+func WithRandomSubDGenerator(gen RandomSubDGenerator) Option {
+	return func(p *PubSub) error {
+		rt, ok := p.rt.(*RandomSubRouter)
+		// check rt's type
+		if !ok {
+			return fmt.Errorf("unexpected router type: need to be RandomSub")
+		}
+		if rt.gen == nil {
+			return fmt.Errorf("unexpected nil generator")
+		}
+		// change rt's generator
+		rt.gen = gen
+		return nil
+	}
 }
