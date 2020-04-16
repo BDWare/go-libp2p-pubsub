@@ -2,11 +2,11 @@
 
 <p align="left">
   <a href="http://protocol.ai"><img src="https://img.shields.io/badge/made%20by-Protocol%20Labs-blue.svg?style=flat-square" /></a>
-  <a href="http://github.com/bdware"><img src="https://img.shields.io/badge/project-bdware-yellow.svg?style=flat-square" /></a>
+  <a href="http://github.com/bdware"><img src="https://img.shields.io/badge/project-bdware-red.svg?style=flat-square" /></a>
   <a href="https://travis-ci.com/bdware/go-libp2p-pubsub"><img src="https://img.shields.io/travis/com/bdware/go-libp2p-pubsub/master?style=flat-square"></a>
   <a href="https://codecov.io/gh/bdware/go-libp2p-pubsub"><img src="https://img.shields.io/codecov/c/github/bdware/go-libp2p-pubsub?style=flat-square"></a>
   <a href="https://github.com/RichardLitt/standard-readme"><img src="https://img.shields.io/badge/readme%20style-standard-brightgreen.svg?style=flat-square" /></a>
-  <a href="https://pkg.go.dev/github.com/bdware/go-libp2p-pubsub"><img src="http://img.shields.io/badge/godoc-reference-5272B4.svg?style=flat-square" /></a>
+  <a href="https://pkg.go.dev/github.com/bdware/go-libp2p-pubsub"><img src="https://img.shields.io/badge/go.dev-reference-007d9c?logo=go&logoColor=white&style=flat-square" /></a>
   <a href=""><img src="https://img.shields.io/badge/golang-%3E%3D1.14.0-orange.svg?style=flat-square" /></a>
   <br>
 </p>
@@ -20,9 +20,7 @@ This repo contains the canonical pubsub implementation for libp2p. We currently 
 
 ## Repo Lead Maintainer
 
-[@vyzo](https://github.com/vyzo/)
-
-> This repo follows the [Repo Lead Maintainer Protocol](https://github.com/ipfs/team-mgmt/blob/master/LEAD_MAINTAINER_PROTOCOL.md)  
+[@huiscool](https://github.com/huiscool/)  
 
 ## Table of Contents
 
