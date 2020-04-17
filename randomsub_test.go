@@ -4,8 +4,8 @@ import (
 	"testing"
 	"time"
 
-	pb "bdware.org/libp2p/go-libp2p-pubsub/pb"
 	"github.com/libp2p/go-libp2p-core/protocol"
+	pb "github.com/libp2p/go-libp2p-pubsub/pb"
 	"github.com/stretchr/testify/assert"
 	"golang.org/x/net/context"
 )
