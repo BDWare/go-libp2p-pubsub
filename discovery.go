@@ -21,6 +21,9 @@ var (
 	DiscoveryPollInterval = 1 * time.Second
 )
 
+// interval at which to retry advertisements when they fail.
+const discoveryAdvertiseRetryInterval = 2 * time.Minute
+
 type DiscoverOpt func(*discoverOptions) error
 
 type discoverOptions struct {
@@ -29,13 +32,13 @@ type discoverOptions struct {
 }
 
 func defaultDiscoverOptions() *discoverOptions {
-	rng := rand.New(rand.NewSource(rand.Int63()))
+	rngSrc := rand.NewSource(rand.Int63())
 	minBackoff, maxBackoff := time.Second*10, time.Hour
 	cacheSize := 100
 	dialTimeout := time.Minute * 2
 	discoverOpts := &discoverOptions{
 		connFactory: func(host host.Host) (*discimpl.BackoffConnector, error) {
-			backoff := discimpl.NewExponentialBackoff(minBackoff, maxBackoff, discimpl.FullJitter, time.Second, 5.0, 0, rng)
+			backoff := discimpl.NewExponentialBackoff(minBackoff, maxBackoff, discimpl.FullJitter, time.Second, 5.0, 0, rand.New(rngSrc))
 			return discimpl.NewBackoffConnector(host, cacheSize, dialTimeout, backoff)
 		},
 	}
@@ -186,20 +189,27 @@ func (d *discover) Advertise(topic string) {
 	go func() {
 		next, err := d.discovery.Advertise(advertisingCtx, topic)
 		if err != nil {
-			log.Warningf("bootstrap: error providing rendezvous for %s: %s", topic, err.Error())
+			log.Warnf("bootstrap: error providing rendezvous for %s: %s", topic, err.Error())
+			if next == 0 {
+				next = discoveryAdvertiseRetryInterval
+			}
 		}
 
 		t := time.NewTimer(next)
-		for {
+		defer t.Stop()
+
+		for advertisingCtx.Err() == nil {
 			select {
 			case <-t.C:
 				next, err = d.discovery.Advertise(advertisingCtx, topic)
 				if err != nil {
-					log.Warningf("bootstrap: error providing rendezvous for %s: %s", topic, err.Error())
+					log.Warnf("bootstrap: error providing rendezvous for %s: %s", topic, err.Error())
+					if next == 0 {
+						next = discoveryAdvertiseRetryInterval
+					}
 				}
 				t.Reset(next)
 			case <-advertisingCtx.Done():
-				t.Stop()
 				return
 			}
 		}
@@ -237,6 +247,7 @@ func (d *discover) Bootstrap(ctx context.Context, topic string, ready RouterRead
 	if !t.Stop() {
 		<-t.C
 	}
+	defer t.Stop()
 
 	for {
 		// Check if ready for publishing

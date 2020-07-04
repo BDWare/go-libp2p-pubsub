@@ -24,6 +24,19 @@ import (
 var TraceBufferSize = 1 << 16 // 64K ought to be enough for everyone; famous last words.
 var MinTraceBatchSize = 16
 
+// rejection reasons
+const (
+	rejectBlacklstedPeer      = "blacklisted peer"
+	rejectBlacklistedSource   = "blacklisted source"
+	rejectMissingSignature    = "missing signature"
+	rejectInvalidSignature    = "invalid signature"
+	rejectValidationQueueFull = "validation queue full"
+	rejectValidationThrottled = "validation throttled"
+	rejectValidationFailed    = "validation failed"
+	rejectValidationIgnored   = "validation ignored"
+	rejectSelfOrigin          = "self originated message"
+)
+
 type basicTracer struct {
 	ch     chan struct{}
 	mx     sync.Mutex
@@ -34,17 +47,17 @@ type basicTracer struct {
 
 func (t *basicTracer) Trace(evt *pb.TraceEvent) {
 	t.mx.Lock()
+	defer t.mx.Unlock()
+
 	if t.closed {
-		t.mx.Unlock()
 		return
 	}
 
 	if t.lossy && len(t.buf) > TraceBufferSize {
-		log.Warningf("trace buffer overflow; dropping trace event")
+		log.Warnf("trace buffer overflow; dropping trace event")
 	} else {
 		t.buf = append(t.buf, evt)
 	}
-	t.mx.Unlock()
 
 	select {
 	case t.ch <- struct{}{}:
@@ -100,7 +113,7 @@ func (t *JSONTracer) doWrite() {
 		for i, evt := range buf {
 			err := enc.Encode(evt)
 			if err != nil {
-				log.Errorf("error writing event trace: %s", err.Error())
+				log.Warnf("error writing event trace: %s", err.Error())
 			}
 			buf[i] = nil
 		}
@@ -152,7 +165,7 @@ func (t *PBTracer) doWrite() {
 		for i, evt := range buf {
 			err := w.WriteMsg(evt)
 			if err != nil {
-				log.Errorf("error writing event trace: %s", err.Error())
+				log.Warnf("error writing event trace: %s", err.Error())
 			}
 			buf[i] = nil
 		}
@@ -189,7 +202,7 @@ func (t *RemoteTracer) doWrite() {
 
 	s, err := t.openStream()
 	if err != nil {
-		log.Errorf("error opening remote tracer stream: %s", err.Error())
+		log.Warnf("error opening remote tracer stream: %s", err.Error())
 		return
 	}
 
@@ -224,13 +237,13 @@ func (t *RemoteTracer) doWrite() {
 
 		err = w.WriteMsg(&batch)
 		if err != nil {
-			log.Errorf("error writing trace event batch: %s", err)
+			log.Warnf("error writing trace event batch: %s", err)
 			goto end
 		}
 
 		err = gzipW.Flush()
 		if err != nil {
-			log.Errorf("error flushin gzip stream: %s", err)
+			log.Warnf("error flushin gzip stream: %s", err)
 			goto end
 		}
 
@@ -254,7 +267,7 @@ func (t *RemoteTracer) doWrite() {
 			s.Reset()
 			s, err = t.openStream()
 			if err != nil {
-				log.Errorf("error opening remote tracer stream: %s", err.Error())
+				log.Warnf("error opening remote tracer stream: %s", err.Error())
 				return
 			}
 

@@ -3,19 +3,26 @@ package pubsub
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"fmt"
+	"io"
 	"math/rand"
 	"sort"
 	"sync"
 	"testing"
 	"time"
 
-	bhost "github.com/libp2p/go-libp2p-blankhost"
+	pb "github.com/libp2p/go-libp2p-pubsub/pb"
+
 	"github.com/libp2p/go-libp2p-core/host"
+	"github.com/libp2p/go-libp2p-core/network"
 	"github.com/libp2p/go-libp2p-core/peer"
 	"github.com/libp2p/go-libp2p-core/protocol"
 
+	bhost "github.com/libp2p/go-libp2p-blankhost"
 	swarmt "github.com/libp2p/go-libp2p-swarm/testing"
+
+	ggio "github.com/gogo/protobuf/io"
 )
 
 func checkMessageRouting(t *testing.T, topic string, pubs []*PubSub, subs []*Subscription) {
@@ -354,198 +361,6 @@ func TestOneToOne(t *testing.T) {
 	checkMessageRouting(t, "foobar", psubs, []*Subscription{sub})
 }
 
-func TestRegisterUnregisterValidator(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	hosts := getNetHosts(t, ctx, 1)
-	psubs := getPubsubs(ctx, hosts)
-
-	err := psubs[0].RegisterTopicValidator("foo", func(context.Context, peer.ID, *Message) bool {
-		return true
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	err = psubs[0].UnregisterTopicValidator("foo")
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	err = psubs[0].UnregisterTopicValidator("foo")
-	if err == nil {
-		t.Fatal("Unregistered bogus topic validator")
-	}
-}
-
-func TestValidate(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	hosts := getNetHosts(t, ctx, 2)
-	psubs := getPubsubs(ctx, hosts)
-
-	connect(t, hosts[0], hosts[1])
-	topic := "foobar"
-
-	err := psubs[1].RegisterTopicValidator(topic, func(ctx context.Context, from peer.ID, msg *Message) bool {
-		return !bytes.Contains(msg.Data, []byte("illegal"))
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	sub, err := psubs[1].Subscribe(topic)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	time.Sleep(time.Millisecond * 50)
-
-	msgs := []struct {
-		msg       []byte
-		validates bool
-	}{
-		{msg: []byte("this is a legal message"), validates: true},
-		{msg: []byte("there also is nothing controversial about this message"), validates: true},
-		{msg: []byte("openly illegal content will be censored"), validates: false},
-		{msg: []byte("but subversive actors will use leetspeek to spread 1ll3g4l content"), validates: true},
-	}
-
-	for _, tc := range msgs {
-		for _, p := range psubs {
-			err := p.Publish(topic, tc.msg)
-			if err != nil {
-				t.Fatal(err)
-			}
-
-			select {
-			case msg := <-sub.ch:
-				if !tc.validates {
-					t.Log(msg)
-					t.Error("expected message validation to filter out the message")
-				}
-			case <-time.After(333 * time.Millisecond):
-				if tc.validates {
-					t.Error("expected message validation to accept the message")
-				}
-			}
-		}
-	}
-}
-
-func TestValidateOverload(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	type msg struct {
-		msg       []byte
-		validates bool
-	}
-
-	tcs := []struct {
-		msgs []msg
-
-		maxConcurrency int
-	}{
-		{
-			maxConcurrency: 10,
-			msgs: []msg{
-				{msg: []byte("this is a legal message"), validates: true},
-				{msg: []byte("but subversive actors will use leetspeek to spread 1ll3g4l content"), validates: true},
-				{msg: []byte("there also is nothing controversial about this message"), validates: true},
-				{msg: []byte("also fine"), validates: true},
-				{msg: []byte("still, all good"), validates: true},
-				{msg: []byte("this is getting boring"), validates: true},
-				{msg: []byte("foo"), validates: true},
-				{msg: []byte("foobar"), validates: true},
-				{msg: []byte("foofoo"), validates: true},
-				{msg: []byte("barfoo"), validates: true},
-				{msg: []byte("oh no!"), validates: false},
-			},
-		},
-		{
-			maxConcurrency: 2,
-			msgs: []msg{
-				{msg: []byte("this is a legal message"), validates: true},
-				{msg: []byte("but subversive actors will use leetspeek to spread 1ll3g4l content"), validates: true},
-				{msg: []byte("oh no!"), validates: false},
-			},
-		},
-	}
-
-	for _, tc := range tcs {
-
-		hosts := getNetHosts(t, ctx, 2)
-		psubs := getPubsubs(ctx, hosts)
-
-		connect(t, hosts[0], hosts[1])
-		topic := "foobar"
-
-		block := make(chan struct{})
-
-		err := psubs[1].RegisterTopicValidator(topic,
-			func(ctx context.Context, from peer.ID, msg *Message) bool {
-				<-block
-				return true
-			},
-			WithValidatorConcurrency(tc.maxConcurrency))
-
-		if err != nil {
-			t.Fatal(err)
-		}
-
-		sub, err := psubs[1].Subscribe(topic)
-		if err != nil {
-			t.Fatal(err)
-		}
-
-		time.Sleep(time.Millisecond * 50)
-
-		if len(tc.msgs) != tc.maxConcurrency+1 {
-			t.Fatalf("expected number of messages sent to be maxConcurrency+1. Got %d, expected %d", len(tc.msgs), tc.maxConcurrency+1)
-		}
-
-		p := psubs[0]
-
-		var wg sync.WaitGroup
-		wg.Add(1)
-		go func() {
-			for _, tmsg := range tc.msgs {
-				select {
-				case msg := <-sub.ch:
-					if !tmsg.validates {
-						t.Log(msg)
-						t.Error("expected message validation to drop the message because all validator goroutines are taken")
-					}
-				case <-time.After(333 * time.Millisecond):
-					if tmsg.validates {
-						t.Error("expected message validation to accept the message")
-					}
-				}
-			}
-			wg.Done()
-		}()
-
-		for i, tmsg := range tc.msgs {
-			err := p.Publish(topic, tmsg.msg)
-			if err != nil {
-				t.Fatal(err)
-			}
-
-			// wait a bit to let pubsub's internal state machine start validating the message
-			time.Sleep(10 * time.Millisecond)
-
-			// unblock validator goroutines after we sent one too many
-			if i == len(tc.msgs)-1 {
-				close(block)
-			}
-		}
-		wg.Wait()
-	}
-}
-
 func assertPeerLists(t *testing.T, hosts []host.Host, ps *PubSub, has ...int) {
 	peers := ps.ListPeers("")
 	set := make(map[peer.ID]struct{})
@@ -873,7 +688,7 @@ func TestPeerDisconnect(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	time.Sleep(time.Millisecond * 10)
+	time.Sleep(time.Millisecond * 300)
 
 	peers := psubs[0].ListPeers("foo")
 	assertPeerList(t, peers, hosts[1].ID())
@@ -881,7 +696,7 @@ func TestPeerDisconnect(t *testing.T) {
 		c.Close()
 	}
 
-	time.Sleep(time.Millisecond * 10)
+	time.Sleep(time.Millisecond * 300)
 
 	peers = psubs[0].ListPeers("foo")
 	assertPeerList(t, peers)
@@ -1117,5 +932,166 @@ func TestMessageSender(t *testing.T) {
 				}
 			}
 		}
+	}
+}
+
+func TestConfigurableMaxMessageSize(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	hosts := getNetHosts(t, ctx, 10)
+
+	// use a 4mb limit; default is 1mb; we'll test with a 2mb payload.
+	psubs := getPubsubs(ctx, hosts, WithMaxMessageSize(1<<22))
+
+	sparseConnect(t, hosts)
+	time.Sleep(time.Millisecond * 100)
+
+	const topic = "foobar"
+	var subs []*Subscription
+	for _, ps := range psubs {
+		subch, err := ps.Subscribe(topic)
+		if err != nil {
+			t.Fatal(err)
+		}
+		subs = append(subs, subch)
+	}
+
+	// 2mb payload.
+	msg := make([]byte, 1<<21)
+	rand.Read(msg)
+	err := psubs[0].Publish(topic, msg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// make sure that all peers received the message.
+	for _, sub := range subs {
+		got, err := sub.Next(ctx)
+		if err != nil {
+			t.Fatal(sub.err)
+		}
+		if !bytes.Equal(msg, got.Data) {
+			t.Fatal("got wrong message!")
+		}
+	}
+
+}
+
+func TestAnnounceRetry(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	hosts := getNetHosts(t, ctx, 2)
+	ps := getPubsub(ctx, hosts[0])
+	watcher := &announceWatcher{}
+	hosts[1].SetStreamHandler(FloodSubID, watcher.handleStream)
+
+	_, err := ps.Subscribe("test")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// connect the watcher to the pubsub
+	connect(t, hosts[0], hosts[1])
+
+	// wait a bit for the first subscription to be emitted and trigger announce retry
+	time.Sleep(100 * time.Millisecond)
+	go ps.announceRetry(hosts[1].ID(), "test", true)
+
+	// wait a bit for the subscription to propagate and ensure it was received twice
+	time.Sleep(time.Second + 100*time.Millisecond)
+	count := watcher.countSubs()
+	if count != 2 {
+		t.Fatalf("expected 2 subscription messages, but got %d", count)
+	}
+}
+
+type announceWatcher struct {
+	mx   sync.Mutex
+	subs int
+}
+
+func (aw *announceWatcher) handleStream(s network.Stream) {
+	defer s.Close()
+
+	r := ggio.NewDelimitedReader(s, 1<<20)
+
+	var rpc pb.RPC
+	for {
+		rpc.Reset()
+		err := r.ReadMsg(&rpc)
+		if err != nil {
+			if err != io.EOF {
+				s.Reset()
+			}
+			return
+		}
+
+		for _, sub := range rpc.GetSubscriptions() {
+			if sub.GetSubscribe() && sub.GetTopicid() == "test" {
+				aw.mx.Lock()
+				aw.subs++
+				aw.mx.Unlock()
+			}
+		}
+	}
+}
+
+func (aw *announceWatcher) countSubs() int {
+	aw.mx.Lock()
+	defer aw.mx.Unlock()
+	return aw.subs
+}
+
+func TestPubsubWithAssortedOptions(t *testing.T) {
+	// this test uses assorted options that are not covered in other tests
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	hashMsgID := func(m *pb.Message) string {
+		hash := sha256.Sum256(m.Data)
+		return string(hash[:])
+	}
+
+	hosts := getNetHosts(t, ctx, 2)
+	psubs := getPubsubs(ctx, hosts,
+		WithMessageIdFn(hashMsgID),
+		WithPeerOutboundQueueSize(10),
+		WithMessageAuthor(""),
+		WithBlacklist(NewMapBlacklist()))
+
+	connect(t, hosts[0], hosts[1])
+
+	var subs []*Subscription
+	for _, ps := range psubs {
+		sub, err := ps.Subscribe("test")
+		if err != nil {
+			t.Fatal(err)
+		}
+		subs = append(subs, sub)
+	}
+
+	time.Sleep(time.Second)
+
+	for i := 0; i < 2; i++ {
+		msg := []byte(fmt.Sprintf("message %d", i))
+		psubs[i].Publish("test", msg)
+
+		for _, sub := range subs {
+			assertReceive(t, sub, msg)
+		}
+	}
+}
+
+func TestWithInvalidMessageAuthor(t *testing.T) {
+	// this test exercises the failure path in the WithMessageAuthor option
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	h := bhost.NewBlankHost(swarmt.GenSwarm(t, ctx))
+	_, err := NewFloodSub(ctx, h, WithMessageAuthor("bogotr0n"))
+	if err == nil {
+		t.Fatal("expected error")
 	}
 }

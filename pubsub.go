@@ -23,6 +23,9 @@ import (
 	timecache "github.com/whyrusleeping/timecache"
 )
 
+// DefaultMaximumMessageSize is 1mb.
+const DefaultMaxMessageSize = 1 << 20
+
 var (
 	TimeCacheDuration = 120 * time.Second
 )
@@ -48,6 +51,10 @@ type PubSub struct {
 
 	tracer *pubsubTracer
 
+	// maxMessageSize is the maximum message size; it applies globally to all
+	// topics.
+	maxMessageSize int
+
 	// size of the outbound message channel that we maintain for each peer
 	peerOutboundQueueSize int
 
@@ -59,6 +66,12 @@ type PubSub struct {
 
 	// addSub is a control channel for us to add and remove subscriptions
 	addSub chan *addSubReq
+
+	// addRelay is a control channel for us to add and remove relays
+	addRelay chan *addRelayReq
+
+	// rmRelay is a relay cancellation channel
+	rmRelay chan string
 
 	// get list of topics we are subscribed to
 	getTopics chan *topicReq
@@ -89,6 +102,9 @@ type PubSub struct {
 
 	// The set of topics we are subscribed to
 	mySubs map[string]map[*Subscription]struct{}
+
+	// The set of topics we are relaying for
+	myRelays map[string]int
 
 	// The set of topics we are interested in
 	myTopics map[string]*Topic
@@ -144,11 +160,16 @@ type PubSubRouter interface {
 	// EnoughPeers returns whether the router needs more peers before it's ready to publish new records.
 	// Suggested (if greater than 0) is a suggested number of peers that the router should need.
 	EnoughPeers(topic string, suggested int) bool
+	// AcceptFrom is invoked on any incoming message before pushing it to the validation pipeline
+	// or processing control information.
+	// Allows routers with internal scoring to vet peers before committing any processing resources
+	// to the message and implement an effective graylist.
+	AcceptFrom(peer.ID) bool
 	// HandleRPC is invoked to process control messages in the RPC envelope.
 	// It is invoked after subscriptions and payload messages have been processed.
 	HandleRPC(*RPC)
 	// Publish is invoked to forward a new message that has been validated.
-	Publish(peer.ID, *pb.Message)
+	Publish(*Message)
 	// Join notifies the router that we want to receive and forward messages in a topic.
 	// It is invoked after the subscription announcement.
 	Join(topic string)
@@ -184,6 +205,7 @@ func NewPubSub(ctx context.Context, h host.Host, rt PubSubRouter, opts ...Option
 		rt:                    rt,
 		val:                   newValidation(),
 		disc:                  &discover{},
+		maxMessageSize:        DefaultMaxMessageSize,
 		peerOutboundQueueSize: 32,
 		signID:                h.ID(),
 		signKey:               h.Peerstore().PrivKey(h.ID()),
@@ -197,6 +219,8 @@ func NewPubSub(ctx context.Context, h host.Host, rt PubSubRouter, opts ...Option
 		cancelCh:              make(chan *Subscription),
 		getPeers:              make(chan *listPeerReq),
 		addSub:                make(chan *addSubReq),
+		addRelay:              make(chan *addRelayReq),
+		rmRelay:               make(chan string),
 		addTopic:              make(chan *addTopicReq),
 		rmTopic:               make(chan *rmTopicReq),
 		getTopics:             make(chan *topicReq),
@@ -206,6 +230,7 @@ func NewPubSub(ctx context.Context, h host.Host, rt PubSubRouter, opts ...Option
 		eval:                  make(chan func()),
 		myTopics:              make(map[string]*Topic),
 		mySubs:                make(map[string]map[*Subscription]struct{}),
+		myRelays:              make(map[string]int),
 		topics:                make(map[string]map[peer.ID]struct{}),
 		peers:                 make(map[peer.ID]chan *RPC),
 		blacklist:             NewMapBlacklist(),
@@ -295,13 +320,14 @@ func WithMessageSigning(enabled bool) Option {
 // must be available in the host's peerstore.
 func WithMessageAuthor(author peer.ID) Option {
 	return func(p *PubSub) error {
+		author := author
 		if author == "" {
 			author = p.host.ID()
 		}
 		if p.signKey != nil {
 			newSignKey := p.host.Peerstore().PrivKey(author)
 			if newSignKey == nil {
-				return fmt.Errorf("can't sign for peer %s: no private key", p.signID)
+				return fmt.Errorf("can't sign for peer %s: no private key", author)
 			}
 			p.signKey = newSignKey
 		}
@@ -348,7 +374,51 @@ func WithDiscovery(d discovery.Discovery, opts ...DiscoverOpt) Option {
 // WithEventTracer provides a tracer for the pubsub system
 func WithEventTracer(tracer EventTracer) Option {
 	return func(p *PubSub) error {
-		p.tracer = &pubsubTracer{tracer: tracer, pid: p.host.ID(), msgID: p.msgID}
+		if p.tracer != nil {
+			p.tracer.tracer = tracer
+		} else {
+			p.tracer = &pubsubTracer{tracer: tracer, pid: p.host.ID(), msgID: p.msgID}
+		}
+		return nil
+	}
+}
+
+// withInternalTracer adds an internal event tracer to the pubsub system
+func withInternalTracer(tracer internalTracer) Option {
+	return func(p *PubSub) error {
+		if p.tracer != nil {
+			p.tracer.internal = append(p.tracer.internal, tracer)
+		} else {
+			p.tracer = &pubsubTracer{internal: []internalTracer{tracer}, pid: p.host.ID(), msgID: p.msgID}
+		}
+		return nil
+	}
+}
+
+// WithMaxMessageSize sets the global maximum message size for pubsub wire
+// messages. The default value is 1MiB (DefaultMaxMessageSize).
+//
+// Observe the following warnings when setting this option.
+//
+// WARNING #1: Make sure to change the default protocol prefixes for floodsub
+// (FloodSubID) and gossipsub (GossipSubID). This avoids accidentally joining
+// the public default network, which uses the default max message size, and
+// therefore will cause messages to be dropped.
+//
+// WARNING #2: Reducing the default max message limit is fine, if you are
+// certain that your application messages will not exceed the new limit.
+// However, be wary of increasing the limit, as pubsub networks are naturally
+// write-amplifying, i.e. for every message we receive, we send D copies of the
+// message to our peers. If those messages are large, the bandwidth requirements
+// will grow linearly. Note that propagation is sent on the uplink, which
+// traditionally is more constrained than the downlink. Instead, consider
+// out-of-band retrieval for large messages, by sending a CID (Content-ID) or
+// another type of locator, such that messages can be fetched on-demand, rather
+// than being pushed proactively. Under this design, you'd use the pubsub layer
+// as a signalling system, rather than a data delivery system.
+func WithMaxMessageSize(maxMessageSize int) Option {
+	return func(ps *PubSub) error {
+		ps.maxMessageSize = maxMessageSize
 		return nil
 	}
 }
@@ -368,12 +438,12 @@ func (p *PubSub) processLoop(ctx context.Context) {
 		select {
 		case pid := <-p.newPeers:
 			if _, ok := p.peers[pid]; ok {
-				log.Warning("already have connection to peer: ", pid)
+				log.Warn("already have connection to peer: ", pid)
 				continue
 			}
 
 			if p.blacklist.Contains(pid) {
-				log.Warning("ignoring connection from blacklisted peer: ", pid)
+				log.Warn("ignoring connection from blacklisted peer: ", pid)
 				continue
 			}
 
@@ -387,13 +457,13 @@ func (p *PubSub) processLoop(ctx context.Context) {
 
 			ch, ok := p.peers[pid]
 			if !ok {
-				log.Warning("new stream for unknown peer: ", pid)
+				log.Warn("new stream for unknown peer: ", pid)
 				s.Reset()
 				continue
 			}
 
 			if p.blacklist.Contains(pid) {
-				log.Warning("closing stream for blacklisted peer: ", pid)
+				log.Warn("closing stream for blacklisted peer: ", pid)
 				close(ch)
 				s.Reset()
 				continue
@@ -415,7 +485,7 @@ func (p *PubSub) processLoop(ctx context.Context) {
 			if p.host.Network().Connectedness(pid) == network.Connected {
 				// still connected, must be a duplicate connection being closed.
 				// we respawn the writer as we need to ensure there is a stream active
-				log.Warning("peer declared dead but still connected; respawning writer: ", pid)
+				log.Warn("peer declared dead but still connected; respawning writer: ", pid)
 				messages := make(chan *RPC, p.peerOutboundQueueSize)
 				messages <- p.getHelloPacket()
 				go p.handleNewPeer(ctx, pid, messages)
@@ -447,6 +517,10 @@ func (p *PubSub) processLoop(ctx context.Context) {
 			p.handleRemoveSubscription(sub)
 		case sub := <-p.addSub:
 			p.handleAddSubscription(sub)
+		case relay := <-p.addRelay:
+			p.handleAddRelay(relay)
+		case topic := <-p.rmRelay:
+			p.handleRemoveRelay(topic)
 		case preq := <-p.getPeers:
 			tmap, ok := p.topics[preq.topic]
 			if preq.topic != "" && !ok {
@@ -533,7 +607,9 @@ func (p *PubSub) handleRemoveTopic(req *rmTopicReq) {
 		return
 	}
 
-	if len(topic.evtHandlers) == 0 && len(p.mySubs[req.topic.topic]) == 0 {
+	if len(topic.evtHandlers) == 0 &&
+		len(p.mySubs[req.topic.topic]) == 0 &&
+		p.myRelays[req.topic.topic] == 0 {
 		delete(p.myTopics, topic.topic)
 		req.resp <- nil
 		return
@@ -543,8 +619,8 @@ func (p *PubSub) handleRemoveTopic(req *rmTopicReq) {
 }
 
 // handleRemoveSubscription removes Subscription sub from bookeeping.
-// If this was the last Subscription for a given topic, it will also announce
-// that this node is not subscribing to this topic anymore.
+// If this was the last subscription and no more relays exist for a given topic,
+// it will also announce that this node is not subscribing to this topic anymore.
 // Only called from processLoop.
 func (p *PubSub) handleRemoveSubscription(sub *Subscription) {
 	subs := p.mySubs[sub.topic]
@@ -559,22 +635,26 @@ func (p *PubSub) handleRemoveSubscription(sub *Subscription) {
 
 	if len(subs) == 0 {
 		delete(p.mySubs, sub.topic)
-		p.disc.StopAdvertise(sub.topic)
-		p.announce(sub.topic, false)
-		p.rt.Leave(sub.topic)
+
+		// stop announcing only if there are no more subs and relays
+		if p.myRelays[sub.topic] == 0 {
+			p.disc.StopAdvertise(sub.topic)
+			p.announce(sub.topic, false)
+			p.rt.Leave(sub.topic)
+		}
 	}
 }
 
 // handleAddSubscription adds a Subscription for a particular topic. If it is
-// the first Subscription for the topic, it will announce that this node
-// subscribes to the topic.
+// the first subscription and no relays exist so far for the topic, it will
+// announce that this node subscribes to the topic.
 // Only called from processLoop.
 func (p *PubSub) handleAddSubscription(req *addSubReq) {
 	sub := req.sub
 	subs := p.mySubs[sub.topic]
 
-	// announce we want this topic
-	if len(subs) == 0 {
+	// announce we want this topic if neither subs nor relays exist so far
+	if len(subs) == 0 && p.myRelays[sub.topic] == 0 {
 		p.disc.Advertise(sub.topic)
 		p.announce(sub.topic, true)
 		p.rt.Join(sub.topic)
@@ -590,6 +670,64 @@ func (p *PubSub) handleAddSubscription(req *addSubReq) {
 	p.mySubs[sub.topic][sub] = struct{}{}
 
 	req.resp <- sub
+}
+
+// handleAddRelay adds a relay for a particular topic. If it is
+// the first relay and no subscriptions exist so far for the topic , it will
+// announce that this node relays for the topic.
+// Only called from processLoop.
+func (p *PubSub) handleAddRelay(req *addRelayReq) {
+	topic := req.topic
+
+	p.myRelays[topic]++
+
+	// announce we want this topic if neither relays nor subs exist so far
+	if p.myRelays[topic] == 1 && len(p.mySubs[topic]) == 0 {
+		p.disc.Advertise(topic)
+		p.announce(topic, true)
+		p.rt.Join(topic)
+	}
+
+	// flag used to prevent calling cancel function multiple times
+	isCancelled := false
+
+	relayCancelFunc := func() {
+		if isCancelled {
+			return
+		}
+
+		select {
+		case p.rmRelay <- topic:
+			isCancelled = true
+		case <-p.ctx.Done():
+		}
+	}
+
+	req.resp <- relayCancelFunc
+}
+
+// handleRemoveRelay removes one relay reference from bookkeeping.
+// If this was the last relay reference and no more subscriptions exist
+// for a given topic, it will also announce that this node is not relaying
+// for this topic anymore.
+// Only called from processLoop.
+func (p *PubSub) handleRemoveRelay(topic string) {
+	if p.myRelays[topic] == 0 {
+		return
+	}
+
+	p.myRelays[topic]--
+
+	if p.myRelays[topic] == 0 {
+		delete(p.myRelays, topic)
+
+		// stop announcing only if there are no more relays and subs
+		if len(p.mySubs[topic]) == 0 {
+			p.disc.StopAdvertise(topic)
+			p.announce(topic, false)
+			p.rt.Leave(topic)
+		}
+	}
 }
 
 // announce announces whether or not this node is interested in a given topic
@@ -617,7 +755,11 @@ func (p *PubSub) announceRetry(pid peer.ID, topic string, sub bool) {
 	time.Sleep(time.Duration(1+rand.Intn(1000)) * time.Millisecond)
 
 	retry := func() {
-		_, ok := p.mySubs[topic]
+		_, okSubs := p.mySubs[topic]
+		_, okRelays := p.myRelays[topic]
+
+		ok := okSubs || okRelays
+
 		if (ok && sub) || (!ok && !sub) {
 			p.doAnnounceRetry(pid, topic, sub)
 		}
@@ -701,6 +843,21 @@ func (p *PubSub) subscribedToMsg(msg *pb.Message) bool {
 	return false
 }
 
+// canRelayMsg returns whether we are able to relay for one of the topics
+// of a given message
+func (p *PubSub) canRelayMsg(msg *pb.Message) bool {
+	if len(p.myRelays) == 0 {
+		return false
+	}
+
+	for _, t := range msg.GetTopicIDs() {
+		if relays := p.myRelays[t]; relays != 0 {
+			return true
+		}
+	}
+	return false
+}
+
 func (p *PubSub) notifyLeave(topic string, pid peer.ID) {
 	if t, ok := p.myTopics[topic]; ok {
 		t.sendNotification(PeerEvent{PeerLeave, pid})
@@ -739,9 +896,15 @@ func (p *PubSub) handleIncomingRPC(rpc *RPC) {
 		}
 	}
 
+	// ask the router to vet the peer before commiting any processing resources
+	if !p.rt.AcceptFrom(rpc.from) {
+		log.Infof("received message from router graylisted peer %s. Dropping RPC", rpc.from)
+		return
+	}
+
 	for _, pmsg := range rpc.GetPublish() {
-		if !p.subscribedToMsg(pmsg) {
-			log.Warning("received message we didn't subscribe to. Dropping.")
+		if !(p.subscribedToMsg(pmsg) || p.canRelayMsg(pmsg)) {
+			log.Warn("received message we didn't subscribe to. Dropping.")
 			continue
 		}
 
@@ -762,22 +925,30 @@ func (p *PubSub) pushMsg(msg *Message) {
 	src := msg.ReceivedFrom
 	// reject messages from blacklisted peers
 	if p.blacklist.Contains(src) {
-		log.Warningf("dropping message from blacklisted peer %s", src)
-		p.tracer.RejectMessage(msg, "blacklisted peer")
+		log.Warnf("dropping message from blacklisted peer %s", src)
+		p.tracer.RejectMessage(msg, rejectBlacklstedPeer)
 		return
 	}
 
 	// even if they are forwarded by good peers
 	if p.blacklist.Contains(msg.GetFrom()) {
-		log.Warningf("dropping message from blacklisted source %s", src)
-		p.tracer.RejectMessage(msg, "blacklisted source")
+		log.Warnf("dropping message from blacklisted source %s", src)
+		p.tracer.RejectMessage(msg, rejectBlacklistedSource)
 		return
 	}
 
 	// reject unsigned messages when strict before we even process the id
 	if p.signStrict && msg.Signature == nil {
 		log.Debugf("dropping unsigned message from %s", src)
-		p.tracer.RejectMessage(msg, "missing signature")
+		p.tracer.RejectMessage(msg, rejectMissingSignature)
+		return
+	}
+
+	// reject messages claiming to be from ourselves but not locally published
+	self := p.host.ID()
+	if peer.ID(msg.GetFrom()) == self && src != self {
+		log.Debugf("dropping message claiming to be from self but forwarded from %s", src)
+		p.tracer.RejectMessage(msg, rejectSelfOrigin)
 		return
 	}
 
@@ -800,7 +971,7 @@ func (p *PubSub) pushMsg(msg *Message) {
 func (p *PubSub) publishMessage(msg *Message) {
 	p.tracer.DeliverMessage(msg)
 	p.notifySubs(msg)
-	p.rt.Publish(msg.ReceivedFrom, msg.Message)
+	p.rt.Publish(msg)
 }
 
 type addTopicReq struct {
@@ -973,7 +1144,7 @@ func (p *PubSub) BlacklistPeer(pid peer.ID) {
 // By default validators are asynchronous, which means they will run in a separate goroutine.
 // The number of active goroutines is controlled by global and per topic validator
 // throttles; if it exceeds the throttle threshold, messages will be dropped.
-func (p *PubSub) RegisterTopicValidator(topic string, val Validator, opts ...ValidatorOpt) error {
+func (p *PubSub) RegisterTopicValidator(topic string, val interface{}, opts ...ValidatorOpt) error {
 	addVal := &addValReq{
 		topic:    topic,
 		validate: val,
@@ -1009,4 +1180,11 @@ func (p *PubSub) UnregisterTopicValidator(topic string) error {
 		return p.ctx.Err()
 	}
 	return <-rmVal.resp
+}
+
+type RelayCancelFunc func()
+
+type addRelayReq struct {
+	topic string
+	resp  chan RelayCancelFunc
 }

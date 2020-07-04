@@ -27,13 +27,17 @@ This repo contains the canonical pubsub implementation for libp2p. We currently 
 <!-- START doctoc generated TOC please keep comment here to allow auto update -->
 <!-- DON'T EDIT THIS SECTION, INSTEAD RE-RUN doctoc TO UPDATE -->
 
-- [Install](#install)
-- [Usage](#usage)
-- [Implementations](#implementations)
-- [Documentation](#documentation)
-- [Tracing](#tracing)
-- [Contribute](#contribute)
-- [License](#license)
+- [go-libp2p-pubsub](#go-libp2p-pubsub)
+  - [Repo Lead Maintainer](#repo-lead-maintainer)
+  - [Table of Contents](#table-of-contents)
+  - [Install](#install)
+  - [Usage](#usage)
+    - [Examples](#examples)
+  - [Documentation](#documentation)
+    - [In this repo, you will find](#in-this-repo-you-will-find)
+    - [Tracing](#tracing)
+  - [Contribute](#contribute)
+  - [License](#license)
 
 <!-- END doctoc generated TOC please keep comment here to allow auto update -->
 
