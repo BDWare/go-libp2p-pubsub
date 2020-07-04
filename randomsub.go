@@ -2,6 +2,7 @@ package pubsub
 
 import (
 	"context"
+	"fmt"
 
 	pb "github.com/libp2p/go-libp2p-pubsub/pb"
 
@@ -10,10 +11,12 @@ import (
 	"github.com/libp2p/go-libp2p-core/protocol"
 )
 
+// RandomSubID is the default protocol ID used by randomSub
 const (
 	RandomSubID = protocol.ID("/randomsub/1.0.0")
 )
 
+// RandomSubD is the default number of peers to be forwarded.
 var (
 	RandomSubD = 6
 )
@@ -21,7 +24,9 @@ var (
 // NewRandomSub returns a new PubSub object using RandomSubRouter as the router.
 func NewRandomSub(ctx context.Context, h host.Host, opts ...Option) (*PubSub, error) {
 	rt := &RandomSubRouter{
-		peers: make(map[peer.ID]protocol.ID),
+		peers:     make(map[peer.ID]protocol.ID),
+		gen:       DefaultRandomSubDGenerator,
+		protocols: []protocol.ID{RandomSubID, FloodSubID},
 	}
 	return NewPubSub(ctx, h, rt, opts...)
 }
@@ -29,13 +34,15 @@ func NewRandomSub(ctx context.Context, h host.Host, opts ...Option) (*PubSub, er
 // RandomSubRouter is a router that implements a random propagation strategy.
 // For each message, it selects RandomSubD peers and forwards the message to them.
 type RandomSubRouter struct {
-	p      *PubSub
-	peers  map[peer.ID]protocol.ID
-	tracer *pubsubTracer
+	p         *PubSub
+	peers     map[peer.ID]protocol.ID
+	tracer    *pubsubTracer
+	gen       RandomSubDGenerator
+	protocols []protocol.ID
 }
 
 func (rs *RandomSubRouter) Protocols() []protocol.ID {
-	return []protocol.ID{RandomSubID, FloodSubID}
+	return rs.protocols
 }
 
 func (rs *RandomSubRouter) Attach(p *PubSub) {
@@ -114,10 +121,13 @@ func (rs *RandomSubRouter) Publish(from peer.ID, msg *pb.Message) {
 		}
 	}
 
-	if len(rspeers) > RandomSubD {
+	// get randomSubD for each massage
+	randomSubD := rs.gen(msg)
+
+	if len(rspeers) > randomSubD {
 		xpeers := peerMapToList(rspeers)
 		shufflePeers(xpeers)
-		xpeers = xpeers[:RandomSubD]
+		xpeers = xpeers[:randomSubD]
 		for _, p := range xpeers {
 			tosend[p] = struct{}{}
 		}
@@ -150,4 +160,46 @@ func (rs *RandomSubRouter) Join(topic string) {
 
 func (rs *RandomSubRouter) Leave(topic string) {
 	rs.tracer.Join(topic)
+}
+
+// RandomSubDGenerator is the function that controls how many peers to be forwarded.
+type RandomSubDGenerator func(msg *pb.Message) int
+
+// DefaultRandomSubDGenerator returns the default RandomSubD
+func DefaultRandomSubDGenerator(msg *pb.Message) int {
+	return RandomSubD
+}
+
+// WithRandomSubDGenerator is the option that changes randomSubDGenerator
+func WithRandomSubDGenerator(gen RandomSubDGenerator) Option {
+	return func(p *PubSub) error {
+		rt, ok := p.rt.(*RandomSubRouter)
+		// check rt's type
+		if !ok {
+			return fmt.Errorf("unexpected router type: need to be RandomSub")
+		}
+		if rt.gen == nil {
+			return fmt.Errorf("unexpected nil generator")
+		}
+		// change rt's generator
+		rt.gen = gen
+		return nil
+	}
+}
+
+// WithCustomProtocols changes the protocols of randomsub.
+func WithCustomProtocols(protos []protocol.ID) Option {
+	return func(p *PubSub) error {
+		rt, ok := p.rt.(*RandomSubRouter)
+		// check rt's type
+		if !ok {
+			return fmt.Errorf("unexpected router type: need to be RandomSub")
+		}
+		if len(protos) == 0 {
+			return fmt.Errorf("unexpected empty protos")
+		}
+		// change rt's generator
+		rt.protocols = protos
+		return nil
+	}
 }
