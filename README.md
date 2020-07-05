@@ -2,9 +2,10 @@
 
 <p align="left">
   <a href="http://protocol.ai"><img src="https://img.shields.io/badge/made%20by-Protocol%20Labs-blue.svg?style=flat-square" /></a>
-  <a href="http://github.com/bdware"><img src="https://img.shields.io/badge/project-bdware-red.svg?style=flat-square" /></a>
+  <a href="https://bdware.org/"><img src="https://img.shields.io/badge/project-bdware-red.svg?style=flat-square" /></a>
   <a href="https://travis-ci.com/bdware/go-libp2p-pubsub"><img src="https://img.shields.io/travis/com/bdware/go-libp2p-pubsub/master?style=flat-square"></a>
   <a href="https://codecov.io/gh/bdware/go-libp2p-pubsub"><img src="https://img.shields.io/codecov/c/github/bdware/go-libp2p-pubsub?style=flat-square"></a>
+  <a href="https://goreportcard.com/report/github.com/bdware/go-libp2p-pubsub"><img src="https://goreportcard.com/badge/github.com/bdware/go-libp2p-pubsub" /></a>
   <a href="https://github.com/RichardLitt/standard-readme"><img src="https://img.shields.io/badge/readme%20style-standard-brightgreen.svg?style=flat-square" /></a>
   <a href="https://pkg.go.dev/github.com/bdware/go-libp2p-pubsub"><img src="https://img.shields.io/badge/go.dev-reference-007d9c?logo=go&logoColor=white&style=flat-square" /></a>
   <a href=""><img src="https://img.shields.io/badge/golang-%3E%3D1.14.0-orange.svg?style=flat-square" /></a>
@@ -87,10 +88,12 @@ and [API documentation](https://pkg.go.dev/github.com/bdware/go-libp2p-pubsub).
 ├── validation.go
 # Floodsub router
 ├── floodsub.go
-# Randomsub router 
+# Randomsub router
 ├── randomsub.go
-# Gossipsub router 
+# Gossipsub router
 ├── gossipsub.go
+├── score.go
+├── score_params.go
 └── mcache.go
 ```
 

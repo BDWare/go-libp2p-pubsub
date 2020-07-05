@@ -14,15 +14,34 @@ type EventTracer interface {
 	Trace(evt *pb.TraceEvent)
 }
 
+// internal interface for score tracing
+type internalTracer interface {
+	AddPeer(p peer.ID, proto protocol.ID)
+	RemovePeer(p peer.ID)
+	Join(topic string)
+	Leave(topic string)
+	Graft(p peer.ID, topic string)
+	Prune(p peer.ID, topic string)
+	ValidateMessage(msg *Message)
+	DeliverMessage(msg *Message)
+	RejectMessage(msg *Message, reason string)
+	DuplicateMessage(msg *Message)
+}
+
 // pubsub tracer details
 type pubsubTracer struct {
-	tracer EventTracer
-	pid    peer.ID
-	msgID  MsgIdFunction
+	tracer   EventTracer
+	internal []internalTracer
+	pid      peer.ID
+	msgID    MsgIdFunction
 }
 
 func (t *pubsubTracer) PublishMessage(msg *Message) {
 	if t == nil {
+		return
+	}
+
+	if t.tracer == nil {
 		return
 	}
 
@@ -40,8 +59,30 @@ func (t *pubsubTracer) PublishMessage(msg *Message) {
 	t.tracer.Trace(evt)
 }
 
+func (t *pubsubTracer) ValidateMessage(msg *Message) {
+	if t == nil {
+		return
+	}
+
+	if msg.ReceivedFrom != t.pid {
+		for _, tr := range t.internal {
+			tr.ValidateMessage(msg)
+		}
+	}
+}
+
 func (t *pubsubTracer) RejectMessage(msg *Message, reason string) {
 	if t == nil {
+		return
+	}
+
+	if msg.ReceivedFrom != t.pid {
+		for _, tr := range t.internal {
+			tr.RejectMessage(msg, reason)
+		}
+	}
+
+	if t.tracer == nil {
 		return
 	}
 
@@ -65,6 +106,16 @@ func (t *pubsubTracer) DuplicateMessage(msg *Message) {
 		return
 	}
 
+	if msg.ReceivedFrom != t.pid {
+		for _, tr := range t.internal {
+			tr.DuplicateMessage(msg)
+		}
+	}
+
+	if t.tracer == nil {
+		return
+	}
+
 	now := time.Now().UnixNano()
 	evt := &pb.TraceEvent{
 		Type:      pb.TraceEvent_DUPLICATE_MESSAGE.Enum(),
@@ -84,6 +135,16 @@ func (t *pubsubTracer) DeliverMessage(msg *Message) {
 		return
 	}
 
+	if msg.ReceivedFrom != t.pid {
+		for _, tr := range t.internal {
+			tr.DeliverMessage(msg)
+		}
+	}
+
+	if t.tracer == nil {
+		return
+	}
+
 	now := time.Now().UnixNano()
 	evt := &pb.TraceEvent{
 		Type:      pb.TraceEvent_DELIVER_MESSAGE.Enum(),
@@ -99,6 +160,14 @@ func (t *pubsubTracer) DeliverMessage(msg *Message) {
 
 func (t *pubsubTracer) AddPeer(p peer.ID, proto protocol.ID) {
 	if t == nil {
+		return
+	}
+
+	for _, tr := range t.internal {
+		tr.AddPeer(p, proto)
+	}
+
+	if t.tracer == nil {
 		return
 	}
 
@@ -122,6 +191,14 @@ func (t *pubsubTracer) RemovePeer(p peer.ID) {
 		return
 	}
 
+	for _, tr := range t.internal {
+		tr.RemovePeer(p)
+	}
+
+	if t.tracer == nil {
+		return
+	}
+
 	now := time.Now().UnixNano()
 	evt := &pb.TraceEvent{
 		Type:      pb.TraceEvent_REMOVE_PEER.Enum(),
@@ -137,6 +214,10 @@ func (t *pubsubTracer) RemovePeer(p peer.ID) {
 
 func (t *pubsubTracer) RecvRPC(rpc *RPC) {
 	if t == nil {
+		return
+	}
+
+	if t.tracer == nil {
 		return
 	}
 
@@ -159,6 +240,10 @@ func (t *pubsubTracer) SendRPC(rpc *RPC, p peer.ID) {
 		return
 	}
 
+	if t.tracer == nil {
+		return
+	}
+
 	now := time.Now().UnixNano()
 	evt := &pb.TraceEvent{
 		Type:      pb.TraceEvent_SEND_RPC.Enum(),
@@ -175,6 +260,10 @@ func (t *pubsubTracer) SendRPC(rpc *RPC, p peer.ID) {
 
 func (t *pubsubTracer) DropRPC(rpc *RPC, p peer.ID) {
 	if t == nil {
+		return
+	}
+
+	if t.tracer == nil {
 		return
 	}
 
@@ -272,6 +361,14 @@ func (t *pubsubTracer) Join(topic string) {
 		return
 	}
 
+	for _, tr := range t.internal {
+		tr.Join(topic)
+	}
+
+	if t.tracer == nil {
+		return
+	}
+
 	now := time.Now().UnixNano()
 	evt := &pb.TraceEvent{
 		Type:      pb.TraceEvent_JOIN.Enum(),
@@ -287,6 +384,14 @@ func (t *pubsubTracer) Join(topic string) {
 
 func (t *pubsubTracer) Leave(topic string) {
 	if t == nil {
+		return
+	}
+
+	for _, tr := range t.internal {
+		tr.Leave(topic)
+	}
+
+	if t.tracer == nil {
 		return
 	}
 
@@ -308,6 +413,14 @@ func (t *pubsubTracer) Graft(p peer.ID, topic string) {
 		return
 	}
 
+	for _, tr := range t.internal {
+		tr.Graft(p, topic)
+	}
+
+	if t.tracer == nil {
+		return
+	}
+
 	now := time.Now().UnixNano()
 	evt := &pb.TraceEvent{
 		Type:      pb.TraceEvent_GRAFT.Enum(),
@@ -324,6 +437,14 @@ func (t *pubsubTracer) Graft(p peer.ID, topic string) {
 
 func (t *pubsubTracer) Prune(p peer.ID, topic string) {
 	if t == nil {
+		return
+	}
+
+	for _, tr := range t.internal {
+		tr.Prune(p, topic)
+	}
+
+	if t.tracer == nil {
 		return
 	}
 

@@ -15,8 +15,30 @@ const (
 	defaultValidateThrottle    = 8192
 )
 
-// Validator is a function that validates a message.
+// Validator is a function that validates a message with a binary decision: accept or reject.
 type Validator func(context.Context, peer.ID, *Message) bool
+
+// ValidatorEx is an extended validation function that validates a message with an enumerated decision
+type ValidatorEx func(context.Context, peer.ID, *Message) ValidationResult
+
+// ValidationResult represents the decision of an extended validator
+type ValidationResult int
+
+const (
+	// ValidationAccept is a validation decision that indicates a valid message that should be accepted and
+	// delivered to the application and forwarded to the network.
+	ValidationAccept = ValidationResult(0)
+	// ValidationReject is a validation decision that indicates an invalid message that should not be
+	// delivered to the application or forwarded to the application. Furthermore the peer that forwarded
+	// the message should be penalized by peer scoring routers.
+	ValidationReject = ValidationResult(1)
+	// ValidationIgnore is a validation decision that indicates a message that should be ignored: it will
+	// be neither delivered to the application nor forwarded to the network. However, in contrast to
+	// ValidationReject, the peer that forwarded the message must not be penalized by peer scoring routers.
+	ValidationIgnore = ValidationResult(2)
+	// internal
+	validationThrottled = ValidationResult(-1)
+)
 
 // ValidatorOpt is an option for RegisterTopicValidator.
 type ValidatorOpt func(addVal *addValReq) error
@@ -57,7 +79,7 @@ type validateReq struct {
 // representation of topic validators
 type topicVal struct {
 	topic            string
-	validate         Validator
+	validate         ValidatorEx
 	validateTimeout  time.Duration
 	validateThrottle chan struct{}
 	validateInline   bool
@@ -66,7 +88,7 @@ type topicVal struct {
 // async request to add a topic validators
 type addValReq struct {
 	topic    string
-	validate Validator
+	validate interface{}
 	timeout  time.Duration
 	throttle int
 	inline   bool
@@ -109,9 +131,36 @@ func (v *validation) AddValidator(req *addValReq) {
 		return
 	}
 
+	makeValidatorEx := func(v Validator) ValidatorEx {
+		return func(ctx context.Context, p peer.ID, msg *Message) ValidationResult {
+			if v(ctx, p, msg) {
+				return ValidationAccept
+			} else {
+				return ValidationReject
+			}
+		}
+	}
+
+	var validator ValidatorEx
+	switch v := req.validate.(type) {
+	case func(ctx context.Context, p peer.ID, msg *Message) bool:
+		validator = makeValidatorEx(Validator(v))
+	case Validator:
+		validator = makeValidatorEx(v)
+
+	case func(ctx context.Context, p peer.ID, msg *Message) ValidationResult:
+		validator = ValidatorEx(v)
+	case ValidatorEx:
+		validator = v
+
+	default:
+		req.resp <- fmt.Errorf("Unknown validator type for topic %s; must be an instance of Validator or ValidatorEx", topic)
+		return
+	}
+
 	val := &topicVal{
 		topic:            topic,
-		validate:         req.validate,
+		validate:         validator,
 		validateTimeout:  0,
 		validateThrottle: make(chan struct{}, defaultValidateConcurrency),
 		validateInline:   req.inline,
@@ -151,8 +200,8 @@ func (v *validation) Push(src peer.ID, msg *Message) bool {
 		select {
 		case v.validateQ <- &validateReq{vals, src, msg}:
 		default:
-			log.Warningf("message validation throttled; dropping message from %s", src)
-			v.tracer.RejectMessage(msg, "validation throttled")
+			log.Warnf("message validation throttled: queue full; dropping message from %s", src)
+			v.tracer.RejectMessage(msg, rejectValidationQueueFull)
 		}
 		return false
 	}
@@ -194,8 +243,8 @@ func (v *validation) validateWorker() {
 func (v *validation) validate(vals []*topicVal, src peer.ID, msg *Message) {
 	if msg.Signature != nil {
 		if !v.validateSignature(msg) {
-			log.Warningf("message signature validation failed; dropping message from %s", src)
-			v.tracer.RejectMessage(msg, "invalid signature")
+			log.Warnf("message signature validation failed; dropping message from %s", src)
+			v.tracer.RejectMessage(msg, rejectInvalidSignature)
 			return
 		}
 	}
@@ -206,6 +255,8 @@ func (v *validation) validate(vals []*topicVal, src peer.ID, msg *Message) {
 	if !v.p.markSeen(id) {
 		v.tracer.DuplicateMessage(msg)
 		return
+	} else {
+		v.tracer.ValidateMessage(msg)
 	}
 
 	var inline, async []*topicVal
@@ -218,12 +269,23 @@ func (v *validation) validate(vals []*topicVal, src peer.ID, msg *Message) {
 	}
 
 	// apply inline (synchronous) validators
+	result := ValidationAccept
+loop:
 	for _, val := range inline {
-		if !val.validateMsg(v.p.ctx, src, msg) {
-			log.Debugf("message validation failed; dropping message from %s", src)
-			v.tracer.RejectMessage(msg, "validation failed")
-			return
+		switch val.validateMsg(v.p.ctx, src, msg) {
+		case ValidationAccept:
+		case ValidationReject:
+			result = ValidationReject
+			break loop
+		case ValidationIgnore:
+			result = ValidationIgnore
 		}
+	}
+
+	if result == ValidationReject {
+		log.Warnf("message validation failed; dropping message from %s", src)
+		v.tracer.RejectMessage(msg, rejectValidationFailed)
+		return
 	}
 
 	// apply async validators
@@ -231,17 +293,22 @@ func (v *validation) validate(vals []*topicVal, src peer.ID, msg *Message) {
 		select {
 		case v.validateThrottle <- struct{}{}:
 			go func() {
-				v.doValidateTopic(async, src, msg)
+				v.doValidateTopic(async, src, msg, result)
 				<-v.validateThrottle
 			}()
 		default:
-			log.Warningf("message validation throttled; dropping message from %s", src)
-			v.tracer.RejectMessage(msg, "validation throttled")
+			log.Warnf("message validation throttled; dropping message from %s", src)
+			v.tracer.RejectMessage(msg, rejectValidationThrottled)
 		}
 		return
 	}
 
-	// no async validators, send the message
+	if result == ValidationIgnore {
+		v.tracer.RejectMessage(msg, rejectValidationIgnored)
+		return
+	}
+
+	// no async validators, accepted message, send it!
 	v.p.sendMsg <- msg
 }
 
@@ -255,17 +322,35 @@ func (v *validation) validateSignature(msg *Message) bool {
 	return true
 }
 
-func (v *validation) doValidateTopic(vals []*topicVal, src peer.ID, msg *Message) {
-	if !v.validateTopic(vals, src, msg) {
-		log.Warningf("message validation failed; dropping message from %s", src)
-		v.tracer.RejectMessage(msg, "validation failed")
-		return
+func (v *validation) doValidateTopic(vals []*topicVal, src peer.ID, msg *Message, r ValidationResult) {
+	result := v.validateTopic(vals, src, msg)
+
+	if result == ValidationAccept && r != ValidationAccept {
+		result = r
 	}
 
-	v.p.sendMsg <- msg
+	switch result {
+	case ValidationAccept:
+		v.p.sendMsg <- msg
+	case ValidationReject:
+		log.Debugf("message validation failed; dropping message from %s", src)
+		v.tracer.RejectMessage(msg, rejectValidationFailed)
+		return
+	case ValidationIgnore:
+		log.Debugf("message validation punted; ignoring message from %s", src)
+		v.tracer.RejectMessage(msg, rejectValidationIgnored)
+		return
+	case validationThrottled:
+		log.Warnf("message validation throttled; ignoring message from %s", src)
+		v.tracer.RejectMessage(msg, rejectValidationThrottled)
+
+	default:
+		// BUG: this would be an internal programming error, so a panic seems appropiate.
+		panic(fmt.Errorf("Unexpected validation result: %d", result))
+	}
 }
 
-func (v *validation) validateTopic(vals []*topicVal, src peer.ID, msg *Message) bool {
+func (v *validation) validateTopic(vals []*topicVal, src peer.ID, msg *Message) ValidationResult {
 	if len(vals) == 1 {
 		return v.validateSingleTopic(vals[0], src, msg)
 	}
@@ -273,11 +358,9 @@ func (v *validation) validateTopic(vals []*topicVal, src peer.ID, msg *Message) 
 	ctx, cancel := context.WithCancel(v.p.ctx)
 	defer cancel()
 
-	rch := make(chan bool, len(vals))
+	rch := make(chan ValidationResult, len(vals))
 	rcount := 0
-	throttle := false
 
-loop:
 	for _, val := range vals {
 		rcount++
 
@@ -290,55 +373,66 @@ loop:
 
 		default:
 			log.Debugf("validation throttled for topic %s", val.topic)
-			throttle = true
-			break loop
+			rch <- validationThrottled
 		}
 	}
 
-	if throttle {
-		v.tracer.RejectMessage(msg, "validation throttled")
-		return false
-	}
-
+	result := ValidationAccept
+loop:
 	for i := 0; i < rcount; i++ {
-		valid := <-rch
-		if !valid {
-			return false
+		switch <-rch {
+		case ValidationAccept:
+		case ValidationReject:
+			result = ValidationReject
+			break loop
+		case ValidationIgnore:
+			// throttled validation has the same effect, but takes precedence over Ignore as it is not
+			// known whether the throttled validator would have signaled rejection.
+			if result != validationThrottled {
+				result = ValidationIgnore
+			}
+		case validationThrottled:
+			result = validationThrottled
 		}
 	}
 
-	return true
+	return result
 }
 
 // fast path for single topic validation that avoids the extra goroutine
-func (v *validation) validateSingleTopic(val *topicVal, src peer.ID, msg *Message) bool {
+func (v *validation) validateSingleTopic(val *topicVal, src peer.ID, msg *Message) ValidationResult {
 	select {
 	case val.validateThrottle <- struct{}{}:
 		res := val.validateMsg(v.p.ctx, src, msg)
 		<-val.validateThrottle
-
 		return res
 
 	default:
 		log.Debugf("validation throttled for topic %s", val.topic)
-		v.tracer.RejectMessage(msg, "validation throttled")
-		return false
+		return validationThrottled
 	}
 }
 
-func (val *topicVal) validateMsg(ctx context.Context, src peer.ID, msg *Message) bool {
+func (val *topicVal) validateMsg(ctx context.Context, src peer.ID, msg *Message) ValidationResult {
 	if val.validateTimeout > 0 {
 		var cancel func()
 		ctx, cancel = context.WithTimeout(ctx, val.validateTimeout)
 		defer cancel()
 	}
 
-	valid := val.validate(ctx, src, msg)
-	if !valid {
-		log.Debugf("validation failed for topic %s", val.topic)
-	}
+	r := val.validate(ctx, src, msg)
+	switch r {
+	case ValidationAccept:
+		fallthrough
+	case ValidationReject:
+		fallthrough
+	case ValidationIgnore:
+		return r
 
-	return valid
+	default:
+		log.Warnf("Unexpected result from validator: %d; ignoring message", r)
+		return ValidationIgnore
+	}
 }
 
 /// Options

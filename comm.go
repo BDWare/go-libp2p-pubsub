@@ -19,7 +19,18 @@ import (
 // get the initial RPC containing all of our subscriptions to send to new peers
 func (p *PubSub) getHelloPacket() *RPC {
 	var rpc RPC
+
+	subscriptions := make(map[string]bool)
+
 	for t := range p.mySubs {
+		subscriptions[t] = true
+	}
+
+	for t := range p.myRelays {
+		subscriptions[t] = true
+	}
+
+	for t := range subscriptions {
 		as := &pb.RPC_SubOpts{
 			Topicid:   proto.String(t),
 			Subscribe: proto.Bool(true),
@@ -60,7 +71,7 @@ func (p *PubSub) handleNewStream(s network.Stream) {
 func (p *PubSub) handleNewPeer(ctx context.Context, pid peer.ID, outgoing <-chan *RPC) {
 	s, err := p.host.NewStream(p.ctx, pid, p.rt.Protocols()...)
 	if err != nil {
-		log.Warning("opening new stream to peer: ", err, pid)
+		log.Warn("opening new stream to peer: ", err, pid)
 
 		var ch chan peer.ID
 		if err == ms.ErrNotSupported {
@@ -96,7 +107,7 @@ func (p *PubSub) handlePeerEOF(ctx context.Context, s network.Stream) {
 			}
 			return
 		}
-		log.Warning("unexpected message from ", s.Conn().RemotePeer())
+		log.Warn("unexpected message from ", s.Conn().RemotePeer())
 	}
 }
 
