@@ -1,3 +1,7 @@
+// Copyright for portions of this fork are held by [Jeromy Johnson, 2016] as
+// part of the original go-libp2p-pubsub project. All other copyright for
+//  this fork are held by [The BDWare Authors, 2020]. All rights reserved.
+
 package pubsub
 
 import (
@@ -6,11 +10,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/libp2p/go-libp2p-core/protocol"
-	pb "github.com/libp2p/go-libp2p-pubsub/pb"
 	"github.com/stretchr/testify/assert"
 
 	"github.com/libp2p/go-libp2p-core/host"
+	"github.com/libp2p/go-libp2p-core/protocol"
+	pb "github.com/libp2p/go-libp2p-pubsub/pb"
 )
 
 func getRandomsub(ctx context.Context, h host.Host, size int, opts ...Option) *PubSub {
@@ -196,6 +200,8 @@ func TestRandomsubEnoughPeers(t *testing.T) {
 		t.Fatal("expected enough peers")
 	}
 }
+
+/* BDWare */
 
 var (
 	defaultSize = 10
