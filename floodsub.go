@@ -89,6 +89,7 @@ func (fs *FloodSubRouter) Publish(msg *Message) {
 	}
 
 	out := rpcWithMessages(msg.Message)
+	sentPeers := make([]peer.ID, 0, len(tosend))
 	for pid := range tosend {
 		if pid == from || pid == peer.ID(msg.GetFrom()) {
 			continue
@@ -102,12 +103,15 @@ func (fs *FloodSubRouter) Publish(msg *Message) {
 		select {
 		case mch <- out:
 			fs.tracer.SendRPC(out, pid)
+			sentPeers = append(sentPeers, pid)
 		default:
 			log.Infof("dropping message to peer %s: queue full", pid)
 			fs.tracer.DropRPC(out, pid)
 			// Drop it. The peer is too slow.
 		}
 	}
+
+	fs.tracer.SendMessageDone(msg, sentPeers)
 }
 
 func (fs *FloodSubRouter) Join(topic string) {

@@ -159,6 +159,7 @@ func (rs *RandomSubRouter) Publish(msg *Message) {
 	}
 
 	out := rpcWithMessages(msg.Message)
+	sentPeers := make([]peer.ID, 0, len(tosend))
 	for p := range tosend {
 		mch, ok := rs.p.peers[p]
 		if !ok {
@@ -168,11 +169,14 @@ func (rs *RandomSubRouter) Publish(msg *Message) {
 		select {
 		case mch <- out:
 			rs.tracer.SendRPC(out, p)
+			sentPeers = append(sentPeers, p)
 		default:
 			log.Infof("dropping message to peer %s: queue full", p)
 			rs.tracer.DropRPC(out, p)
 		}
 	}
+
+	rs.tracer.SendMessageDone(msg, sentPeers)
 }
 
 func (rs *RandomSubRouter) Join(topic string) {
