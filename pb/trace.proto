@@ -20,6 +20,7 @@ message TraceEvent {
   optional Leave leave = 14;
   optional Graft graft = 15;
   optional Prune prune = 16;
+  optional SendMessageDone sendMessageDone = 17;
 
   enum Type {
     PUBLISH_MESSAGE = 0;
@@ -35,6 +36,7 @@ message TraceEvent {
     LEAVE = 10;
     GRAFT = 11;
     PRUNE = 12;
+    SEND_MESSGAE_DONE = 13;
   }
 
   message PublishMessage {
@@ -97,6 +99,12 @@ message TraceEvent {
   message Prune {
     optional bytes peerID = 1;
     optional string topic = 2;
+  }
+
+  message SendMessageDone{
+    optional bytes messageID = 1;
+    repeated string topics = 2;
+    repeated bytes peerIDs = 3;
   }
 
   message RPCMeta {

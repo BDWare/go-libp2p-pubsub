@@ -461,3 +461,29 @@ func (t *pubsubTracer) Prune(p peer.ID, topic string) {
 
 	t.tracer.Trace(evt)
 }
+
+func (t *pubsubTracer) SendMessageDone(msg *Message, sentPeers []peer.ID) {
+	if t == nil || t.tracer == nil {
+		return
+	}
+
+	now := time.Now().UnixNano()
+
+	peerIDs := make([][]byte, 0, len(sentPeers))
+	for _, pid := range sentPeers {
+		peerIDs = append(peerIDs, []byte(pid))
+	}
+
+	evt := &pb.TraceEvent{
+		Type:      pb.TraceEvent_SEND_MESSGAE_DONE.Enum(),
+		PeerID:    []byte(t.pid),
+		Timestamp: &now,
+		SendMessageDone: &pb.TraceEvent_SendMessageDone{
+			MessageID: []byte(t.msgID(msg.Message)),
+			Topics:    msg.Message.TopicIDs,
+			PeerIDs:   peerIDs,
+		},
+	}
+
+	t.tracer.Trace(evt)
+}
