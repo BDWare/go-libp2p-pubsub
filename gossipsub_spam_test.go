@@ -8,13 +8,13 @@ import (
 	"testing"
 	"time"
 
+	pb "github.com/bdware/go-libp2p-pubsub/pb"
 	ggio "github.com/gogo/protobuf/io"
 	logging "github.com/ipfs/go-log"
 	"github.com/libp2p/go-libp2p-core/host"
 	"github.com/libp2p/go-libp2p-core/network"
 	"github.com/libp2p/go-libp2p-core/peer"
 	"github.com/libp2p/go-libp2p-core/protocol"
-	pb "github.com/libp2p/go-libp2p-pubsub/pb"
 )
 
 // Test that when Gossipsub receives too many IWANT messages from a peer

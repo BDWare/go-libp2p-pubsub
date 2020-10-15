@@ -12,9 +12,9 @@ import (
 
 	"github.com/stretchr/testify/assert"
 
+	pb "github.com/bdware/go-libp2p-pubsub/pb"
 	"github.com/libp2p/go-libp2p-core/host"
 	"github.com/libp2p/go-libp2p-core/protocol"
-	pb "github.com/libp2p/go-libp2p-pubsub/pb"
 )
 
 func getRandomsub(ctx context.Context, h host.Host, size int, opts ...Option) *PubSub {

@@ -9,9 +9,9 @@ import (
 	"github.com/libp2p/go-libp2p-core/network"
 	"github.com/libp2p/go-libp2p-core/peer"
 
+	pb "github.com/bdware/go-libp2p-pubsub/pb"
 	ggio "github.com/gogo/protobuf/io"
 	proto "github.com/gogo/protobuf/proto"
-	pb "github.com/libp2p/go-libp2p-pubsub/pb"
 
 	ms "github.com/multiformats/go-multistream"
 )
