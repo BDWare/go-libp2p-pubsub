@@ -5,14 +5,14 @@ import (
 	"context"
 	"io"
 
-	"github.com/libp2p/go-libp2p-core/helpers"
 	"github.com/libp2p/go-libp2p-core/network"
 	"github.com/libp2p/go-libp2p-core/peer"
 
 	pb "github.com/bdware/go-libp2p-pubsub/pb"
-	ggio "github.com/gogo/protobuf/io"
-	proto "github.com/gogo/protobuf/proto"
 
+	"github.com/libp2p/go-msgio/protoio"
+
+	"github.com/gogo/protobuf/proto"
 	ms "github.com/multiformats/go-multistream"
 )
 
@@ -41,14 +41,14 @@ func (p *PubSub) getHelloPacket() *RPC {
 }
 
 func (p *PubSub) handleNewStream(s network.Stream) {
-	r := ggio.NewDelimitedReader(s, p.maxMessageSize)
+	r := protoio.NewDelimitedReader(s, p.maxMessageSize)
 	for {
 		rpc := new(RPC)
 		err := r.ReadMsg(&rpc.RPC)
 		if err != nil {
 			if err != io.EOF {
 				s.Reset()
-				log.Infof("error reading rpc from %s: %s", s.Conn().RemotePeer(), err)
+				log.Debugf("error reading rpc from %s: %s", s.Conn().RemotePeer(), err)
 			} else {
 				// Just be nice. They probably won't read this
 				// but it doesn't hurt to send it.
@@ -71,7 +71,7 @@ func (p *PubSub) handleNewStream(s network.Stream) {
 func (p *PubSub) handleNewPeer(ctx context.Context, pid peer.ID, outgoing <-chan *RPC) {
 	s, err := p.host.NewStream(p.ctx, pid, p.rt.Protocols()...)
 	if err != nil {
-		log.Warn("opening new stream to peer: ", err, pid)
+		log.Debug("opening new stream to peer: ", err, pid)
 
 		var ch chan peer.ID
 		if err == ms.ErrNotSupported {
@@ -96,7 +96,7 @@ func (p *PubSub) handleNewPeer(ctx context.Context, pid peer.ID, outgoing <-chan
 }
 
 func (p *PubSub) handlePeerEOF(ctx context.Context, s network.Stream) {
-	r := ggio.NewDelimitedReader(s, p.maxMessageSize)
+	r := protoio.NewDelimitedReader(s, p.maxMessageSize)
 	rpc := new(RPC)
 	for {
 		err := r.ReadMsg(&rpc.RPC)
@@ -107,13 +107,13 @@ func (p *PubSub) handlePeerEOF(ctx context.Context, s network.Stream) {
 			}
 			return
 		}
-		log.Warn("unexpected message from ", s.Conn().RemotePeer())
+		log.Debugf("unexpected message from %s", s.Conn().RemotePeer())
 	}
 }
 
 func (p *PubSub) handleSendingMessages(ctx context.Context, s network.Stream, outgoing <-chan *RPC) {
 	bufw := bufio.NewWriter(s)
-	wc := ggio.NewDelimitedWriter(bufw)
+	wc := protoio.NewDelimitedWriter(bufw)
 
 	writeMsg := func(msg proto.Message) error {
 		err := wc.WriteMsg(msg)
@@ -124,7 +124,7 @@ func (p *PubSub) handleSendingMessages(ctx context.Context, s network.Stream, ou
 		return bufw.Flush()
 	}
 
-	defer helpers.FullClose(s)
+	defer s.Close()
 	for {
 		select {
 		case rpc, ok := <-outgoing:
@@ -135,7 +135,7 @@ func (p *PubSub) handleSendingMessages(ctx context.Context, s network.Stream, ou
 			err := writeMsg(&rpc.RPC)
 			if err != nil {
 				s.Reset()
-				log.Infof("writing message to %s: %s", s.Conn().RemotePeer(), err)
+				log.Debugf("writing message to %s: %s", s.Conn().RemotePeer(), err)
 				return
 			}
 		case <-ctx.Done():

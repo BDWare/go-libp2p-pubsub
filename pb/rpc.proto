@@ -18,7 +18,7 @@ message Message {
 	optional bytes from = 1;
 	optional bytes data = 2;
 	optional bytes seqno = 3;
-	repeated string topicIDs = 4;
+	optional string topic = 4;
 	optional bytes signature = 5;
 	optional bytes key = 6;
 }
@@ -32,10 +32,12 @@ message ControlMessage {
 
 message ControlIHave {
 	optional string topicID = 1;
+	// implementors from other languages should use bytes here - go protobuf emits invalid utf8 strings
 	repeated string messageIDs = 2;
 }
 
 message ControlIWant {
+	// implementors from other languages should use bytes here - go protobuf emits invalid utf8 strings
 	repeated string messageIDs = 1;
 }
 

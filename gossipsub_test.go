@@ -21,7 +21,7 @@ import (
 	bhost "github.com/libp2p/go-libp2p-blankhost"
 	swarmt "github.com/libp2p/go-libp2p-swarm/testing"
 
-	ggio "github.com/gogo/protobuf/io"
+	"github.com/libp2p/go-msgio/protoio"
 )
 
 func getGossipsub(ctx context.Context, h host.Host, opts ...Option) *PubSub {
@@ -1120,20 +1120,14 @@ func TestGossipsubStarTopologyWithSignedPeerRecords(t *testing.T) {
 }
 
 func TestGossipsubDirectPeers(t *testing.T) {
-	originalGossipSubDirectConnectTicks := GossipSubDirectConnectTicks
-	GossipSubDirectConnectTicks = 2
-	defer func() {
-		GossipSubDirectConnectTicks = originalGossipSubDirectConnectTicks
-	}()
-
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	h := getNetHosts(t, ctx, 3)
 	psubs := []*PubSub{
-		getGossipsub(ctx, h[0]),
-		getGossipsub(ctx, h[1], WithDirectPeers([]peer.AddrInfo{peer.AddrInfo{h[2].ID(), h[2].Addrs()}})),
-		getGossipsub(ctx, h[2], WithDirectPeers([]peer.AddrInfo{peer.AddrInfo{h[1].ID(), h[1].Addrs()}})),
+		getGossipsub(ctx, h[0], WithDirectConnectTicks(2)),
+		getGossipsub(ctx, h[1], WithDirectPeers([]peer.AddrInfo{peer.AddrInfo{h[2].ID(), h[2].Addrs()}}), WithDirectConnectTicks(2)),
+		getGossipsub(ctx, h[2], WithDirectPeers([]peer.AddrInfo{peer.AddrInfo{h[1].ID(), h[1].Addrs()}}), WithDirectConnectTicks(2)),
 	}
 
 	connect(t, h[0], h[1])
@@ -1186,6 +1180,92 @@ func TestGossipsubDirectPeers(t *testing.T) {
 		for _, sub := range subs {
 			assertReceive(t, sub, msg)
 		}
+	}
+}
+
+func TestGossipsubDirectPeersFanout(t *testing.T) {
+	// regression test for #371
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	h := getNetHosts(t, ctx, 3)
+	psubs := []*PubSub{
+		getGossipsub(ctx, h[0]),
+		getGossipsub(ctx, h[1], WithDirectPeers([]peer.AddrInfo{peer.AddrInfo{h[2].ID(), h[2].Addrs()}})),
+		getGossipsub(ctx, h[2], WithDirectPeers([]peer.AddrInfo{peer.AddrInfo{h[1].ID(), h[1].Addrs()}})),
+	}
+
+	connect(t, h[0], h[1])
+	connect(t, h[0], h[2])
+
+	// Join all peers except h2
+	var subs []*Subscription
+	for _, ps := range psubs[:2] {
+		sub, err := ps.Subscribe("test")
+		if err != nil {
+			t.Fatal(err)
+		}
+		subs = append(subs, sub)
+	}
+
+	time.Sleep(time.Second)
+
+	// h2 publishes some messages to build a fanout
+	for i := 0; i < 3; i++ {
+		msg := []byte(fmt.Sprintf("message %d", i))
+		psubs[2].Publish("test", msg)
+
+		for _, sub := range subs {
+			assertReceive(t, sub, msg)
+		}
+	}
+
+	// verify that h0 is in the fanout of h2, but not h1 who is a direct peer
+	result := make(chan bool, 2)
+	psubs[2].eval <- func() {
+		rt := psubs[2].rt.(*GossipSubRouter)
+		fanout := rt.fanout["test"]
+		_, ok := fanout[h[0].ID()]
+		result <- ok
+		_, ok = fanout[h[1].ID()]
+		result <- ok
+	}
+
+	inFanout := <-result
+	if !inFanout {
+		t.Fatal("expected peer 0 to be in fanout")
+	}
+
+	inFanout = <-result
+	if inFanout {
+		t.Fatal("expected peer 1 to not be in fanout")
+	}
+
+	// now subscribe h2 too and verify tht h0 is in the mesh but not h1
+	_, err := psubs[2].Subscribe("test")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	time.Sleep(2 * time.Second)
+
+	psubs[2].eval <- func() {
+		rt := psubs[2].rt.(*GossipSubRouter)
+		mesh := rt.mesh["test"]
+		_, ok := mesh[h[0].ID()]
+		result <- ok
+		_, ok = mesh[h[1].ID()]
+		result <- ok
+	}
+
+	inMesh := <-result
+	if !inMesh {
+		t.Fatal("expected peer 0 to be in mesh")
+	}
+
+	inMesh = <-result
+	if inMesh {
+		t.Fatal("expected peer 1 to not be in mesh")
 	}
 }
 
@@ -1487,6 +1567,62 @@ func TestGossipsubPiggybackControl(t *testing.T) {
 	}
 }
 
+func TestGossipsubMultipleGraftTopics(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	hosts := getNetHosts(t, ctx, 2)
+	psubs := getGossipsubs(ctx, hosts)
+	sparseConnect(t, hosts)
+
+	time.Sleep(time.Second * 1)
+
+	firstTopic := "topic1"
+	secondTopic := "topic2"
+	thirdTopic := "topic3"
+
+	firstPeer := hosts[0].ID()
+	secondPeer := hosts[1].ID()
+
+	p2Sub := psubs[1]
+	p1Router := psubs[0].rt.(*GossipSubRouter)
+	p2Router := psubs[1].rt.(*GossipSubRouter)
+
+	finChan := make(chan struct{})
+
+	p2Sub.eval <- func() {
+		// Add topics to second peer
+		p2Router.mesh[firstTopic] = map[peer.ID]struct{}{}
+		p2Router.mesh[secondTopic] = map[peer.ID]struct{}{}
+		p2Router.mesh[thirdTopic] = map[peer.ID]struct{}{}
+
+		finChan <- struct{}{}
+	}
+	<-finChan
+
+	// Send multiple GRAFT messages to second peer from
+	// 1st peer
+	p1Router.sendGraftPrune(map[peer.ID][]string{
+		secondPeer: []string{firstTopic, secondTopic, thirdTopic},
+	}, map[peer.ID][]string{}, map[peer.ID]bool{})
+
+	time.Sleep(time.Second * 1)
+
+	p2Sub.eval <- func() {
+		if _, ok := p2Router.mesh[firstTopic][firstPeer]; !ok {
+			t.Errorf("First peer wasnt added to mesh of the second peer for the topic %s", firstTopic)
+		}
+		if _, ok := p2Router.mesh[secondTopic][firstPeer]; !ok {
+			t.Errorf("First peer wasnt added to mesh of the second peer for the topic %s", secondTopic)
+		}
+		if _, ok := p2Router.mesh[thirdTopic][firstPeer]; !ok {
+			t.Errorf("First peer wasnt added to mesh of the second peer for the topic %s", thirdTopic)
+		}
+		finChan <- struct{}{}
+	}
+	<-finChan
+}
+
 func TestGossipsubOpportunisticGrafting(t *testing.T) {
 	originalGossipSubPruneBackoff := GossipSubPruneBackoff
 	GossipSubPruneBackoff = 500 * time.Millisecond
@@ -1617,8 +1753,8 @@ func (sq *sybilSquatter) handleStream(s network.Stream) {
 
 	// send a subscription for test in the output stream to become candidate for GRAFT
 	// and then just read and ignore the incoming RPCs
-	r := ggio.NewDelimitedReader(s, 1<<20)
-	w := ggio.NewDelimitedWriter(os)
+	r := protoio.NewDelimitedReader(s, 1<<20)
+	w := protoio.NewDelimitedWriter(os)
 	truth := true
 	topic := "test"
 	err = w.WriteMsg(&pb.RPC{Subscriptions: []*pb.RPC_SubOpts{&pb.RPC_SubOpts{Subscribe: &truth, Topicid: &topic}}})
@@ -1698,6 +1834,57 @@ func TestGossipsubPeerScoreInspect(t *testing.T) {
 	score2 := inspector.score(hosts[1].ID())
 	if score2 < 9 {
 		t.Fatalf("expected score to be at least 9, instead got %f", score2)
+	}
+}
+
+func TestGossipsubPeerScoreResetTopicParams(t *testing.T) {
+	// this test exercises the code path sof peer score inspection
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	hosts := getNetHosts(t, ctx, 1)
+
+	ps := getGossipsub(ctx, hosts[0],
+		WithPeerScore(
+			&PeerScoreParams{
+				Topics: map[string]*TopicScoreParams{
+					"test": &TopicScoreParams{
+						TopicWeight:                    1,
+						TimeInMeshQuantum:              time.Second,
+						FirstMessageDeliveriesWeight:   1,
+						FirstMessageDeliveriesDecay:    0.999,
+						FirstMessageDeliveriesCap:      100,
+						InvalidMessageDeliveriesWeight: -1,
+						InvalidMessageDeliveriesDecay:  0.9999,
+					},
+				},
+				AppSpecificScore: func(peer.ID) float64 { return 0 },
+				DecayInterval:    time.Second,
+				DecayToZero:      0.01,
+			},
+			&PeerScoreThresholds{
+				GossipThreshold:   -1,
+				PublishThreshold:  -10,
+				GraylistThreshold: -1000,
+			}))
+
+	topic, err := ps.Join("test")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = topic.SetScoreParams(
+		&TopicScoreParams{
+			TopicWeight:                    1,
+			TimeInMeshQuantum:              time.Second,
+			FirstMessageDeliveriesWeight:   1,
+			FirstMessageDeliveriesDecay:    0.999,
+			FirstMessageDeliveriesCap:      200,
+			InvalidMessageDeliveriesWeight: -1,
+			InvalidMessageDeliveriesDecay:  0.9999,
+		})
+	if err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -1798,8 +1985,8 @@ func (iwe *iwantEverything) handleStream(s network.Stream) {
 	gossipMsgIdsReceived := make(map[string]struct{})
 
 	// send a subscription for test in the output stream to become candidate for gossip
-	r := ggio.NewDelimitedReader(s, 1<<20)
-	w := ggio.NewDelimitedWriter(os)
+	r := protoio.NewDelimitedReader(s, 1<<20)
+	w := protoio.NewDelimitedWriter(os)
 	truth := true
 	topic := "test"
 	err = w.WriteMsg(&pb.RPC{Subscriptions: []*pb.RPC_SubOpts{&pb.RPC_SubOpts{Subscribe: &truth, Topicid: &topic}}})

@@ -26,16 +26,13 @@ func TestTagTracerMeshTags(t *testing.T) {
 	tt.Graft(p, topic)
 
 	tag := "pubsub:" + topic
-	val := getTagValue(cmgr, p, tag)
-	if val != GossipSubConnTagValueMeshPeer {
-		t.Errorf("expected mesh peer to have tag %s with value %d, got %d",
-			tag, GossipSubConnTagValueMeshPeer, val)
+	if !cmgr.IsProtected(p, tag) {
+		t.Fatal("expected the mesh peer to be protected")
 	}
 
 	tt.Prune(p, topic)
-	val = getTagValue(cmgr, p, tag)
-	if val != 0 {
-		t.Errorf("expected peer to be untagged when pruned from mesh, but tag %s was %d", tag, val)
+	if cmgr.IsProtected(p, tag) {
+		t.Fatal("expected the former mesh peer to be unprotected")
 	}
 }
 
@@ -56,16 +53,14 @@ func TestTagTracerDirectPeerTags(t *testing.T) {
 	tt.AddPeer(p2, GossipSubID_v10)
 	tt.AddPeer(p3, GossipSubID_v10)
 
-	tag := "pubsub:direct"
-	val := getTagValue(cmgr, p1, tag)
-	if val != GossipSubConnTagValueDirectPeer {
-		t.Errorf("expected direct peer to have tag %s value %d, was %d", tag, GossipSubConnTagValueDirectPeer, val)
+	tag := "pubsub:<direct>"
+	if !cmgr.IsProtected(p1, tag) {
+		t.Fatal("expected direct peer to be protected")
 	}
 
 	for _, p := range []peer.ID{p2, p3} {
-		val := getTagValue(cmgr, p, tag)
-		if val != 0 {
-			t.Errorf("expected non-direct peer to have tag %s value %d, was %d", tag, 0, val)
+		if cmgr.IsProtected(p, tag) {
+			t.Fatal("expected non-direct peer to be unprotected")
 		}
 	}
 }
@@ -93,16 +88,16 @@ func TestTagTracerDeliveryTags(t *testing.T) {
 
 	for i := 0; i < 20; i++ {
 		// deliver only 5 messages to topic 2 (less than the cap)
-		topics := []string{topic1}
+		topic := &topic1
 		if i < 5 {
-			topics = append(topics, topic2)
+			topic = &topic2
 		}
 		msg := &Message{
 			ReceivedFrom: p,
 			Message: &pb.Message{
-				From:     []byte(p),
-				Data:     []byte("hello"),
-				TopicIDs: topics,
+				From:  []byte(p),
+				Data:  []byte("hello"),
+				Topic: topic,
 			},
 		}
 		tt.DeliverMessage(msg)
@@ -180,14 +175,13 @@ func TestTagTracerDeliveryTagsNearFirst(t *testing.T) {
 	tt.Join(topic)
 
 	for i := 0; i < GossipSubConnTagMessageDeliveryCap+5; i++ {
-		topics := []string{topic}
 		msg := &Message{
 			ReceivedFrom: p,
 			Message: &pb.Message{
-				From:     []byte(p),
-				Data:     []byte(fmt.Sprintf("msg-%d", i)),
-				TopicIDs: topics,
-				Seqno:    []byte(fmt.Sprintf("%d", i)),
+				From:  []byte(p),
+				Data:  []byte(fmt.Sprintf("msg-%d", i)),
+				Topic: &topic,
+				Seqno: []byte(fmt.Sprintf("%d", i)),
 			},
 		}
 

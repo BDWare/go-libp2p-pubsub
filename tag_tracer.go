@@ -11,16 +11,6 @@ import (
 )
 
 var (
-	// GossipSubConnTagValueDirectPeer is the connection manager tag value to
-	// apply to direct peers. This should be high, as we want to prioritize these
-	// connections above all others.
-	GossipSubConnTagValueDirectPeer = 1000
-
-	// GossipSubConnTagValueMeshPeer is the connection manager tag value to apply to
-	// peers in a topic mesh. If a peer is in the mesh for multiple topics, their
-	// connection will be tagged separately for each.
-	GossipSubConnTagValueMeshPeer = 20
-
 	// GossipSubConnTagBumpMessageDelivery is the amount to add to the connection manager
 	// tag that tracks message deliveries. Each time a peer is the first to deliver a
 	// message within a topic, we "bump" a tag by this amount, up to a maximum
@@ -68,7 +58,7 @@ type tagTracer struct {
 func newTagTracer(cmgr connmgr.ConnManager) *tagTracer {
 	decayer, ok := connmgr.SupportsDecay(cmgr)
 	if !ok {
-		log.Warnf("connection manager does not support decaying tags, delivery tags will not be applied")
+		log.Debugf("connection manager does not support decaying tags, delivery tags will not be applied")
 	}
 	return &tagTracer{
 		cmgr:      cmgr,
@@ -96,18 +86,18 @@ func (t *tagTracer) tagPeerIfDirect(p peer.ID) {
 	// tag peer if it is a direct peer
 	_, direct := t.direct[p]
 	if direct {
-		t.cmgr.TagPeer(p, "pubsub:direct", GossipSubConnTagValueDirectPeer)
+		t.cmgr.Protect(p, "pubsub:<direct>")
 	}
 }
 
 func (t *tagTracer) tagMeshPeer(p peer.ID, topic string) {
 	tag := topicTag(topic)
-	t.cmgr.TagPeer(p, tag, GossipSubConnTagValueMeshPeer)
+	t.cmgr.Protect(p, tag)
 }
 
 func (t *tagTracer) untagMeshPeer(p peer.ID, topic string) {
 	tag := topicTag(topic)
-	t.cmgr.UntagPeer(p, tag)
+	t.cmgr.Unprotect(p, tag)
 }
 
 func topicTag(topic string) string {
@@ -161,11 +151,10 @@ func (t *tagTracer) bumpDeliveryTag(p peer.ID, topic string) error {
 }
 
 func (t *tagTracer) bumpTagsForMessage(p peer.ID, msg *Message) {
-	for _, topic := range msg.TopicIDs {
-		err := t.bumpDeliveryTag(p, topic)
-		if err != nil {
-			log.Warnf("error bumping delivery tag: %s", err)
-		}
+	topic := msg.GetTopic()
+	err := t.bumpDeliveryTag(p, topic)
+	if err != nil {
+		log.Warnf("error bumping delivery tag: %s", err)
 	}
 }
 
@@ -262,4 +251,5 @@ func (t *tagTracer) RejectMessage(msg *Message, reason string) {
 	}
 }
 
-func (t *tagTracer) RemovePeer(peer.ID) {}
+func (t *tagTracer) RemovePeer(peer.ID)      {}
+func (gt *tagTracer) ThrottlePeer(p peer.ID) {}

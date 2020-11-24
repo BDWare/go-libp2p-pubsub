@@ -305,6 +305,21 @@ func WithDirectPeers(pis []peer.AddrInfo) Option {
 	}
 }
 
+// WithDirectConnectTicks is a gossipsub router option that sets the number of
+// heartbeat ticks between attempting to reconnect direct peers that are not
+// currently connected. A "tick" is based on the heartbeat interval, which is
+// 1s by default. The default value for direct connect ticks is 300.
+func WithDirectConnectTicks(t uint64) Option {
+	return func(ps *PubSub) error {
+		gs, ok := ps.rt.(*GossipSubRouter)
+		if !ok {
+			return fmt.Errorf("pubsub router is not gossipsub")
+		}
+		gs.directConnectTicks = t
+		return nil
+	}
+}
+
 // GossipSubRouter is a router that implements the gossipsub protocol.
 // For each topic we have joined, we maintain an overlay through which
 // messages flow; this is the mesh map.
@@ -332,6 +347,7 @@ type GossipSubRouter struct {
 	score        *peerScore
 	gossipTracer *gossipTracer
 	tagTracer    *tagTracer
+	gate         *peerGater
 
 	// whether PX is enabled; this should be enabled in bootstrappers and other well connected/trusted
 	// nodes.
@@ -490,9 +506,17 @@ func (gs *GossipSubRouter) EnoughPeers(topic string, suggested int) bool {
 	return false
 }
 
-func (gs *GossipSubRouter) AcceptFrom(p peer.ID) bool {
+func (gs *GossipSubRouter) AcceptFrom(p peer.ID) AcceptStatus {
 	_, direct := gs.direct[p]
-	return direct || gs.score.Score(p) >= gs.graylistThreshold
+	if direct {
+		return AcceptAll
+	}
+
+	if gs.score.Score(p) < gs.graylistThreshold {
+		return AcceptNone
+	}
+
+	return gs.gate.AcceptFrom(p)
 }
 
 func (gs *GossipSubRouter) HandleRPC(rpc *RPC) {
@@ -845,26 +869,26 @@ func (gs *GossipSubRouter) connector() {
 
 func (gs *GossipSubRouter) Publish(msg *Message) {
 	gs.mcache.Put(msg.Message)
+
 	from := msg.ReceivedFrom
+	topic := msg.GetTopic()
 
 	tosend := make(map[peer.ID]struct{})
-	for _, topic := range msg.GetTopicIDs() {
-		// any peers in the topic?
-		tmap, ok := gs.p.topics[topic]
-		if !ok {
-			continue
-		}
 
-		if gs.floodPublish && from == gs.p.host.ID() {
-			for p := range tmap {
-				_, direct := gs.direct[p]
-				if direct || gs.score.Score(p) >= gs.publishThreshold {
-					tosend[p] = struct{}{}
-				}
+	// any peers in the topic?
+	tmap, ok := gs.p.topics[topic]
+	if !ok {
+		return
+	}
+
+	if gs.floodPublish && from == gs.p.host.ID() {
+		for p := range tmap {
+			_, direct := gs.direct[p]
+			if direct || gs.score.Score(p) >= gs.publishThreshold {
+				tosend[p] = struct{}{}
 			}
-			continue
 		}
-
+	} else {
 		// direct peers
 		for p := range gs.direct {
 			_, inTopic := tmap[p]
@@ -888,7 +912,8 @@ func (gs *GossipSubRouter) Publish(msg *Message) {
 			if !ok || len(gmap) == 0 {
 				// we don't have any, pick some with score above the publish threshold
 				peers := gs.getPeers(topic, gs.D, func(p peer.ID) bool {
-					return gs.score.Score(p) >= gs.publishThreshold
+					_, direct := gs.direct[p]
+					return !direct && gs.score.Score(p) >= gs.publishThreshold
 				})
 
 				if len(peers) > 0 {
@@ -990,7 +1015,7 @@ func (gs *GossipSubRouter) sendGraft(p peer.ID, topic string) {
 }
 
 func (gs *GossipSubRouter) sendPrune(p peer.ID, topic string) {
-	prune := []*pb.ControlPrune{gs.makePrune(p, topic, true)}
+	prune := []*pb.ControlPrune{gs.makePrune(p, topic, gs.doPX)}
 	out := rpcWithControl(nil, nil, nil, nil, prune)
 	gs.sendRPC(p, out)
 }
@@ -1043,7 +1068,7 @@ func (gs *GossipSubRouter) sendRPC(p peer.ID, out *RPC) {
 }
 
 func (gs *GossipSubRouter) doDropRPC(rpc *RPC, p peer.ID, reason string) {
-	log.Warnf("dropping message to peer %s: %s", p.Pretty(), reason)
+	log.Debugf("dropping message to peer %s: %s", p.Pretty(), reason)
 	gs.tracer.DropRPC(rpc, p)
 	// push control messages that need to be retried
 	ctl := rpc.GetControl()
@@ -1485,7 +1510,9 @@ func (gs *GossipSubRouter) clearBackoff() {
 	now := time.Now()
 	for topic, backoff := range gs.backoff {
 		for p, expire := range backoff {
-			if expire.Before(now) {
+			// add some slack time to the expiration
+			// https://github.com/libp2p/specs/pull/289
+			if expire.Add(2 * GossipSubHeartbeatInterval).Before(now) {
 				delete(backoff, p)
 			}
 		}
@@ -1523,7 +1550,12 @@ func (gs *GossipSubRouter) sendGraftPrune(tograft, toprune map[peer.ID][]string,
 	for p, topics := range tograft {
 		graft := make([]*pb.ControlGraft, 0, len(topics))
 		for _, topic := range topics {
-			graft = append(graft, &pb.ControlGraft{TopicID: &topic})
+			// copy topic string here since
+			// the reference to the string
+			// topic here changes with every
+			// iteration of the slice.
+			copiedID := topic
+			graft = append(graft, &pb.ControlGraft{TopicID: &copiedID})
 		}
 
 		var prune []*pb.ControlPrune

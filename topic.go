@@ -26,6 +26,53 @@ type Topic struct {
 	closed bool
 }
 
+// String returns the topic associated with t
+func (t *Topic) String() string {
+	return t.topic
+}
+
+// SetScoreParams sets the topic score parameters if the pubsub router supports peer
+// scoring
+func (t *Topic) SetScoreParams(p *TopicScoreParams) error {
+	err := p.validate()
+	if err != nil {
+		return fmt.Errorf("invalid topic score parameters: %w", err)
+	}
+
+	t.mux.Lock()
+	defer t.mux.Unlock()
+
+	if t.closed {
+		return ErrTopicClosed
+	}
+
+	result := make(chan error, 1)
+	update := func() {
+		gs, ok := t.p.rt.(*GossipSubRouter)
+		if !ok {
+			result <- fmt.Errorf("pubsub router is not gossipsub")
+			return
+		}
+
+		if gs.score == nil {
+			result <- fmt.Errorf("peer scoring is not enabled in router")
+			return
+		}
+
+		err := gs.score.SetTopicScoreParams(t.topic, p)
+		result <- err
+	}
+
+	select {
+	case t.p.eval <- update:
+		err = <-result
+		return err
+
+	case <-t.p.ctx.Done():
+		return t.p.ctx.Err()
+	}
+}
+
 // EventHandler creates a handle for topic specific events
 // Multiple event handlers may be created and will operate independently of each other
 func (t *Topic) EventHandler(opts ...TopicEventHandlerOpt) (*TopicEventHandler, error) {
@@ -164,13 +211,15 @@ func (t *Topic) Publish(ctx context.Context, data []byte, opts ...PubOpt) error 
 		return ErrTopicClosed
 	}
 
-	seqno := t.p.nextSeqno()
-	id := t.p.host.ID()
 	m := &pb.Message{
-		Data:     data,
-		TopicIDs: []string{t.topic},
-		From:     []byte(id),
-		Seqno:    seqno,
+		Data:  data,
+		Topic: &t.topic,
+		From:  nil,
+		Seqno: nil,
+	}
+	if t.p.signID != "" {
+		m.From = []byte(t.p.signID)
+		m.Seqno = t.p.nextSeqno()
 	}
 	if t.p.signKey != nil {
 		m.From = []byte(t.p.signID)
@@ -193,7 +242,7 @@ func (t *Topic) Publish(ctx context.Context, data []byte, opts ...PubOpt) error 
 	}
 
 	select {
-	case t.p.publish <- &Message{m, id, nil}:
+	case t.p.publish <- &Message{m, t.p.host.ID(), nil}:
 	case <-t.p.ctx.Done():
 		return t.p.ctx.Err()
 	}

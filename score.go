@@ -11,7 +11,7 @@ import (
 	"github.com/libp2p/go-libp2p-core/peer"
 	"github.com/libp2p/go-libp2p-core/protocol"
 
-	manet "github.com/multiformats/go-multiaddr-net"
+	manet "github.com/multiformats/go-multiaddr/net"
 )
 
 type peerStats struct {
@@ -78,6 +78,7 @@ type peerScore struct {
 
 	// debugging inspection
 	inspect       PeerScoreInspectFn
+	inspectEx     ExtendedPeerScoreInspectFn
 	inspectPeriod time.Duration
 }
 
@@ -113,13 +114,34 @@ const (
 	deliveryThrottled        // we can't tell if it is valid because validation throttled
 )
 
-type PeerScoreInspectFn func(map[peer.ID]float64)
+type PeerScoreInspectFn = func(map[peer.ID]float64)
+type ExtendedPeerScoreInspectFn = func(map[peer.ID]*PeerScoreSnapshot)
+
+type PeerScoreSnapshot struct {
+	Score              float64
+	Topics             map[string]*TopicScoreSnapshot
+	AppSpecificScore   float64
+	IPColocationFactor float64
+	BehaviourPenalty   float64
+}
+
+type TopicScoreSnapshot struct {
+	TimeInMesh               time.Duration
+	FirstMessageDeliveries   float64
+	MeshMessageDeliveries    float64
+	InvalidMessageDeliveries float64
+}
 
 // WithPeerScoreInspect is a gossipsub router option that enables peer score debugging.
 // When this option is enabled, the supplied function will be invoked periodically to allow
-// the application to inspec or dump the scores for connected peers.
+// the application to inspect or dump the scores for connected peers.
+// The supplied function can have one of two signatures:
+//  - PeerScoreInspectFn, which takes a map of peer IDs to score.
+//  - ExtendedPeerScoreInspectFn, which takes a map of peer IDs to
+//    PeerScoreSnapshots and allows inspection of individual score
+//    components for debugging peer scoring.
 // This option must be passed _after_ the WithPeerScore option.
-func WithPeerScoreInspect(inspect PeerScoreInspectFn, period time.Duration) Option {
+func WithPeerScoreInspect(inspect interface{}, period time.Duration) Option {
 	return func(ps *PubSub) error {
 		gs, ok := ps.rt.(*GossipSubRouter)
 		if !ok {
@@ -130,7 +152,19 @@ func WithPeerScoreInspect(inspect PeerScoreInspectFn, period time.Duration) Opti
 			return fmt.Errorf("peer scoring is not enabled")
 		}
 
-		gs.score.inspect = inspect
+		if gs.score.inspect != nil || gs.score.inspectEx != nil {
+			return fmt.Errorf("duplicate peer score inspector")
+		}
+
+		switch i := inspect.(type) {
+		case PeerScoreInspectFn:
+			gs.score.inspect = i
+		case ExtendedPeerScoreInspectFn:
+			gs.score.inspectEx = i
+		default:
+			return fmt.Errorf("unknown peer score insector type: %v", inspect)
+		}
+
 		gs.score.inspectPeriod = period
 
 		return nil
@@ -146,6 +180,52 @@ func newPeerScore(params *PeerScoreParams) *peerScore {
 		deliveries: &messageDeliveries{records: make(map[string]*deliveryRecord)},
 		msgID:      DefaultMsgIdFn,
 	}
+}
+
+// SetTopicScoreParams sets new score parameters for a topic.
+// If the topic previously had parameters and the parameters are lowering delivery caps,
+// then the score counters are recapped appropriately.
+// Note: assumes that the topic score parameters have already been validated
+func (ps *peerScore) SetTopicScoreParams(topic string, p *TopicScoreParams) error {
+	ps.Lock()
+	defer ps.Unlock()
+
+	old, exist := ps.params.Topics[topic]
+	ps.params.Topics[topic] = p
+
+	if !exist {
+		return nil
+	}
+
+	// check to see if the counter Caps are being lowered; if that's the case we need to recap them
+	recap := false
+	if p.FirstMessageDeliveriesCap < old.FirstMessageDeliveriesCap {
+		recap = true
+	}
+	if p.MeshMessageDeliveriesCap < old.MeshMessageDeliveriesCap {
+		recap = true
+	}
+	if !recap {
+		return nil
+	}
+
+	// recap counters for topic
+	for _, pstats := range ps.peerStats {
+		tstats, ok := pstats.topics[topic]
+		if !ok {
+			continue
+		}
+
+		if tstats.firstMessageDeliveries > p.FirstMessageDeliveriesCap {
+			tstats.firstMessageDeliveries = p.FirstMessageDeliveriesCap
+		}
+
+		if tstats.meshMessageDeliveries > p.MeshMessageDeliveriesCap {
+			tstats.meshMessageDeliveries = p.MeshMessageDeliveriesCap
+		}
+	}
+
+	return nil
 }
 
 // router interface
@@ -236,6 +316,26 @@ func (ps *peerScore) score(p peer.ID) float64 {
 	score += p5 * ps.params.AppSpecificWeight
 
 	// P6: IP collocation factor
+	p6 := ps.ipColocationFactor(p)
+	score += p6 * ps.params.IPColocationFactorWeight
+
+	// P7: behavioural pattern penalty
+	if pstats.behaviourPenalty > ps.params.BehaviourPenaltyThreshold {
+		excess := pstats.behaviourPenalty - ps.params.BehaviourPenaltyThreshold
+		p7 := excess * excess
+		score += p7 * ps.params.BehaviourPenaltyWeight
+	}
+
+	return score
+}
+
+func (ps *peerScore) ipColocationFactor(p peer.ID) float64 {
+	pstats, ok := ps.peerStats[p]
+	if !ok {
+		return 0
+	}
+
+	var result float64
 	for _, ip := range pstats.ips {
 		_, whitelisted := ps.params.IPColocationFactorWhitelist[ip]
 		if whitelisted {
@@ -249,16 +349,11 @@ func (ps *peerScore) score(p peer.ID) float64 {
 		peersInIP := len(ps.peerIPs[ip])
 		if peersInIP > ps.params.IPColocationFactorThreshold {
 			surpluss := float64(peersInIP - ps.params.IPColocationFactorThreshold)
-			p6 := surpluss * surpluss
-			score += p6 * ps.params.IPColocationFactorWeight
+			result += surpluss * surpluss
 		}
 	}
 
-	// P7: behavioural pattern penalty
-	p7 := pstats.behaviourPenalty * pstats.behaviourPenalty
-	score += p7 * ps.params.BehaviourPenaltyWeight
-
-	return score
+	return result
 }
 
 // behavioural pattern penalties
@@ -290,7 +385,7 @@ func (ps *peerScore) background(ctx context.Context) {
 	defer gcDeliveryRecords.Stop()
 
 	var inspectScores <-chan time.Time
-	if ps.inspect != nil {
+	if ps.inspect != nil || ps.inspectEx != nil {
 		ticker := time.NewTicker(ps.inspectPeriod)
 		defer ticker.Stop()
 		// also dump at exit for one final sample
@@ -320,6 +415,15 @@ func (ps *peerScore) background(ctx context.Context) {
 
 // inspectScores dumps all tracked scores into the inspect function.
 func (ps *peerScore) inspectScores() {
+	if ps.inspect != nil {
+		ps.inspectScoresSimple()
+	}
+	if ps.inspectEx != nil {
+		ps.inspectScoresExtended()
+	}
+}
+
+func (ps *peerScore) inspectScoresSimple() {
 	ps.Lock()
 	scores := make(map[peer.ID]float64, len(ps.peerStats))
 	for p := range ps.peerStats {
@@ -332,6 +436,36 @@ func (ps *peerScore) inspectScores() {
 	// it in a separate goroutine. If the function needs to synchronise, it
 	// should do so locally.
 	go ps.inspect(scores)
+}
+
+func (ps *peerScore) inspectScoresExtended() {
+	ps.Lock()
+	scores := make(map[peer.ID]*PeerScoreSnapshot, len(ps.peerStats))
+	for p, pstats := range ps.peerStats {
+		pss := new(PeerScoreSnapshot)
+		pss.Score = ps.score(p)
+		if len(pstats.topics) > 0 {
+			pss.Topics = make(map[string]*TopicScoreSnapshot, len(pstats.topics))
+			for t, ts := range pstats.topics {
+				tss := &TopicScoreSnapshot{
+					FirstMessageDeliveries:   ts.firstMessageDeliveries,
+					MeshMessageDeliveries:    ts.meshMessageDeliveries,
+					InvalidMessageDeliveries: ts.invalidMessageDeliveries,
+				}
+				if ts.inMesh {
+					tss.TimeInMesh = ts.meshTime
+				}
+				pss.Topics[t] = tss
+			}
+		}
+		pss.AppSpecificScore = ps.params.AppSpecificScore(p)
+		pss.IPColocationFactor = ps.ipColocationFactor(p)
+		pss.BehaviourPenalty = pstats.behaviourPenalty
+		scores[p] = pss
+	}
+	ps.Unlock()
+
+	go ps.inspectEx(scores)
 }
 
 // refreshScores decays scores, and purges score records for disconnected peers,
@@ -544,7 +678,7 @@ func (ps *peerScore) DeliverMessage(msg *Message) {
 
 	// defensive check that this is the first delivery trace -- delivery status should be unknown
 	if drec.status != deliveryUnknown {
-		log.Warnf("unexpected delivery trace: message from %s was first seen %s ago and has delivery status %d", msg.ReceivedFrom, time.Now().Sub(drec.firstSeen), drec.status)
+		log.Debugf("unexpected delivery trace: message from %s was first seen %s ago and has delivery status %d", msg.ReceivedFrom, time.Now().Sub(drec.firstSeen), drec.status)
 		return
 	}
 
@@ -570,6 +704,10 @@ func (ps *peerScore) RejectMessage(msg *Message, reason string) {
 		fallthrough
 	case rejectInvalidSignature:
 		fallthrough
+	case rejectUnexpectedSignature:
+		fallthrough
+	case rejectUnexpectedAuthInfo:
+		fallthrough
 	case rejectSelfOrigin:
 		ps.markInvalidMessageDelivery(msg.ReceivedFrom, msg)
 		return
@@ -591,7 +729,7 @@ func (ps *peerScore) RejectMessage(msg *Message, reason string) {
 
 	// defensive check that this is the first rejection trace -- delivery status should be unknown
 	if drec.status != deliveryUnknown {
-		log.Warnf("unexpected rejection trace: message from %s was first seen %s ago and has delivery status %d", msg.ReceivedFrom, time.Now().Sub(drec.firstSeen), drec.status)
+		log.Debugf("unexpected rejection trace: message from %s was first seen %s ago and has delivery status %d", msg.ReceivedFrom, time.Now().Sub(drec.firstSeen), drec.status)
 		return
 	}
 
@@ -656,6 +794,8 @@ func (ps *peerScore) DuplicateMessage(msg *Message) {
 		// the message was ignored; do nothing
 	}
 }
+
+func (ps *peerScore) ThrottlePeer(p peer.ID) {}
 
 // message delivery records
 func (d *messageDeliveries) getRecord(id string) *deliveryRecord {
@@ -725,14 +865,13 @@ func (ps *peerScore) markInvalidMessageDelivery(p peer.ID, msg *Message) {
 		return
 	}
 
-	for _, topic := range msg.GetTopicIDs() {
-		tstats, ok := pstats.getTopicStats(topic, ps.params)
-		if !ok {
-			continue
-		}
-
-		tstats.invalidMessageDeliveries += 1
+	topic := msg.GetTopic()
+	tstats, ok := pstats.getTopicStats(topic, ps.params)
+	if !ok {
+		return
 	}
+
+	tstats.invalidMessageDeliveries += 1
 }
 
 // markFirstMessageDelivery increments the "first message deliveries" counter
@@ -744,27 +883,26 @@ func (ps *peerScore) markFirstMessageDelivery(p peer.ID, msg *Message) {
 		return
 	}
 
-	for _, topic := range msg.GetTopicIDs() {
-		tstats, ok := pstats.getTopicStats(topic, ps.params)
-		if !ok {
-			continue
-		}
+	topic := msg.GetTopic()
+	tstats, ok := pstats.getTopicStats(topic, ps.params)
+	if !ok {
+		return
+	}
 
-		cap := ps.params.Topics[topic].FirstMessageDeliveriesCap
-		tstats.firstMessageDeliveries += 1
-		if tstats.firstMessageDeliveries > cap {
-			tstats.firstMessageDeliveries = cap
-		}
+	cap := ps.params.Topics[topic].FirstMessageDeliveriesCap
+	tstats.firstMessageDeliveries += 1
+	if tstats.firstMessageDeliveries > cap {
+		tstats.firstMessageDeliveries = cap
+	}
 
-		if !tstats.inMesh {
-			continue
-		}
+	if !tstats.inMesh {
+		return
+	}
 
-		cap = ps.params.Topics[topic].MeshMessageDeliveriesCap
-		tstats.meshMessageDeliveries += 1
-		if tstats.meshMessageDeliveries > cap {
-			tstats.meshMessageDeliveries = cap
-		}
+	cap = ps.params.Topics[topic].MeshMessageDeliveriesCap
+	tstats.meshMessageDeliveries += 1
+	if tstats.meshMessageDeliveries > cap {
+		tstats.meshMessageDeliveries = cap
 	}
 }
 
@@ -772,41 +910,34 @@ func (ps *peerScore) markFirstMessageDelivery(p peer.ID, msg *Message) {
 // for messages we've seen before, as long the message was received within the
 // P3 window.
 func (ps *peerScore) markDuplicateMessageDelivery(p peer.ID, msg *Message, validated time.Time) {
-	var now time.Time
-
 	pstats, ok := ps.peerStats[p]
 	if !ok {
 		return
 	}
 
-	if !validated.IsZero() {
-		now = time.Now()
+	topic := msg.GetTopic()
+	tstats, ok := pstats.getTopicStats(topic, ps.params)
+	if !ok {
+		return
 	}
 
-	for _, topic := range msg.GetTopicIDs() {
-		tstats, ok := pstats.getTopicStats(topic, ps.params)
-		if !ok {
-			continue
-		}
+	if !tstats.inMesh {
+		return
+	}
 
-		if !tstats.inMesh {
-			continue
-		}
+	tparams := ps.params.Topics[topic]
 
-		tparams := ps.params.Topics[topic]
+	// check against the mesh delivery window -- if the validated time is passed as 0, then
+	// the message was received before we finished validation and thus falls within the mesh
+	// delivery window.
+	if !validated.IsZero() && time.Since(validated) > tparams.MeshMessageDeliveriesWindow {
+		return
+	}
 
-		// check against the mesh delivery window -- if the validated time is passed as 0, then
-		// the message was received before we finished validation and thus falls within the mesh
-		// delivery window.
-		if !validated.IsZero() && now.After(validated.Add(tparams.MeshMessageDeliveriesWindow)) {
-			continue
-		}
-
-		cap := tparams.MeshMessageDeliveriesCap
-		tstats.meshMessageDeliveries += 1
-		if tstats.meshMessageDeliveries > cap {
-			tstats.meshMessageDeliveries = cap
-		}
+	cap := tparams.MeshMessageDeliveriesCap
+	tstats.meshMessageDeliveries += 1
+	if tstats.meshMessageDeliveries > cap {
+		tstats.meshMessageDeliveries = cap
 	}
 }
 

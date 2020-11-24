@@ -28,6 +28,10 @@ const DefaultMaxMessageSize = 1 << 20
 
 var (
 	TimeCacheDuration = 120 * time.Second
+
+	// ErrSubscriptionCancelled may be returned when a subscription Next() is called after the
+	// subscription has been cancelled.
+	ErrSubscriptionCancelled = errors.New("subscription cancelled")
 )
 
 var log = logging.Logger("pubsub")
@@ -136,12 +140,16 @@ type PubSub struct {
 	// function used to compute the ID for a message
 	msgID MsgIdFunction
 
-	// key for signing messages; nil when signing is disabled (default for now)
+	// key for signing messages; nil when signing is disabled
 	signKey crypto.PrivKey
-	// source ID for signed messages; corresponds to signKey
+	// source ID for signed messages; corresponds to signKey, empty when signing is disabled.
+	// If empty, the author and seq-nr are completely omitted from the messages.
 	signID peer.ID
 	// strict mode rejects all unsigned messages prior to validation
-	signStrict bool
+	signPolicy MessageSignaturePolicy
+
+	// filter for tracking subscriptions in topics of interest; if nil, then we track all subscriptions
+	subFilter SubscriptionFilter
 
 	ctx context.Context
 }
@@ -163,8 +171,8 @@ type PubSubRouter interface {
 	// AcceptFrom is invoked on any incoming message before pushing it to the validation pipeline
 	// or processing control information.
 	// Allows routers with internal scoring to vet peers before committing any processing resources
-	// to the message and implement an effective graylist.
-	AcceptFrom(peer.ID) bool
+	// to the message and implement an effective graylist and react to validation queue overload.
+	AcceptFrom(peer.ID) AcceptStatus
 	// HandleRPC is invoked to process control messages in the RPC envelope.
 	// It is invoked after subscriptions and payload messages have been processed.
 	HandleRPC(*RPC)
@@ -177,6 +185,18 @@ type PubSubRouter interface {
 	// It is invoked after the unsubscription announcement.
 	Leave(topic string)
 }
+
+type AcceptStatus int
+
+const (
+	// AcceptAll signals to accept the incoming RPC for full processing
+	AcceptNone AcceptStatus = iota
+	// AcceptControl signals to accept the incoming RPC only for control message processing by
+	// the router. Included payload messages will _not_ be pushed to the validation queue.
+	AcceptControl
+	// AcceptNone signals to drop the incoming RPC
+	AcceptAll
+)
 
 type Message struct {
 	*pb.Message
@@ -208,8 +228,8 @@ func NewPubSub(ctx context.Context, h host.Host, rt PubSubRouter, opts ...Option
 		maxMessageSize:        DefaultMaxMessageSize,
 		peerOutboundQueueSize: 32,
 		signID:                h.ID(),
-		signKey:               h.Peerstore().PrivKey(h.ID()),
-		signStrict:            true,
+		signKey:               nil,
+		signPolicy:            StrictSign,
 		incoming:              make(chan *RPC, 32),
 		publish:               make(chan *Message),
 		newPeers:              make(chan peer.ID),
@@ -247,8 +267,14 @@ func NewPubSub(ctx context.Context, h host.Host, rt PubSubRouter, opts ...Option
 		}
 	}
 
-	if ps.signStrict && ps.signKey == nil {
-		return nil, fmt.Errorf("strict signature verification enabled but message signing is disabled")
+	if ps.signPolicy.mustSign() {
+		if ps.signID == "" {
+			return nil, fmt.Errorf("strict signature usage enabled but message author was disabled")
+		}
+		ps.signKey = ps.host.Peerstore().PrivKey(ps.signID)
+		if ps.signKey == nil {
+			return nil, fmt.Errorf("can't sign for peer %s: no private key", ps.signID)
+		}
 	}
 
 	if err := ps.disc.Start(ps); err != nil {
@@ -299,17 +325,23 @@ func WithPeerOutboundQueueSize(size int) Option {
 	}
 }
 
+// WithMessageSignaturePolicy sets the mode of operation for producing and verifying message signatures.
+func WithMessageSignaturePolicy(policy MessageSignaturePolicy) Option {
+	return func(p *PubSub) error {
+		p.signPolicy = policy
+		return nil
+	}
+}
+
 // WithMessageSigning enables or disables message signing (enabled by default).
+// Deprecated: signature verification without message signing,
+// or message signing without verification, are not recommended.
 func WithMessageSigning(enabled bool) Option {
 	return func(p *PubSub) error {
 		if enabled {
-			p.signKey = p.host.Peerstore().PrivKey(p.signID)
-			if p.signKey == nil {
-				return fmt.Errorf("can't sign for peer %s: no private key", p.signID)
-			}
+			p.signPolicy |= msgSigning
 		} else {
-			p.signKey = nil
-			p.signStrict = false
+			p.signPolicy &^= msgSigning
 		}
 		return nil
 	}
@@ -324,23 +356,32 @@ func WithMessageAuthor(author peer.ID) Option {
 		if author == "" {
 			author = p.host.ID()
 		}
-		if p.signKey != nil {
-			newSignKey := p.host.Peerstore().PrivKey(author)
-			if newSignKey == nil {
-				return fmt.Errorf("can't sign for peer %s: no private key", author)
-			}
-			p.signKey = newSignKey
-		}
 		p.signID = author
+		return nil
+	}
+}
+
+// WithNoAuthor omits the author and seq-number data of messages, and disables the use of signatures.
+// Not recommended to use with the default message ID function, see WithMessageIdFn.
+func WithNoAuthor() Option {
+	return func(p *PubSub) error {
+		p.signID = ""
+		p.signPolicy &^= msgSigning
 		return nil
 	}
 }
 
 // WithStrictSignatureVerification is an option to enable or disable strict message signing.
 // When enabled (which is the default), unsigned messages will be discarded.
+// Deprecated: signature verification without message signing,
+// or message signing without verification, are not recommended.
 func WithStrictSignatureVerification(required bool) Option {
 	return func(p *PubSub) error {
-		p.signStrict = required
+		if required {
+			p.signPolicy |= msgVerification
+		} else {
+			p.signPolicy &^= msgVerification
+		}
 		return nil
 	}
 }
@@ -629,7 +670,7 @@ func (p *PubSub) handleRemoveSubscription(sub *Subscription) {
 		return
 	}
 
-	sub.err = fmt.Errorf("subscription cancelled by calling sub.Cancel()")
+	sub.err = ErrSubscriptionCancelled
 	sub.close()
 	delete(subs, sub)
 
@@ -796,14 +837,13 @@ func (p *PubSub) doAnnounceRetry(pid peer.ID, topic string, sub bool) {
 // notifySubs sends a given message to all corresponding subscribers.
 // Only called from processLoop.
 func (p *PubSub) notifySubs(msg *Message) {
-	for _, topic := range msg.GetTopicIDs() {
-		subs := p.mySubs[topic]
-		for f := range subs {
-			select {
-			case f.ch <- msg:
-			default:
-				log.Infof("Can't deliver message to subscription for topic %s; subscriber too slow", topic)
-			}
+	topic := msg.GetTopic()
+	subs := p.mySubs[topic]
+	for f := range subs {
+		select {
+		case f.ch <- msg:
+		default:
+			log.Infof("Can't deliver message to subscription for topic %s; subscriber too slow", topic)
 		}
 	}
 }
@@ -835,12 +875,10 @@ func (p *PubSub) subscribedToMsg(msg *pb.Message) bool {
 		return false
 	}
 
-	for _, t := range msg.GetTopicIDs() {
-		if _, ok := p.mySubs[t]; ok {
-			return true
-		}
-	}
-	return false
+	topic := msg.GetTopic()
+	_, ok := p.mySubs[topic]
+
+	return ok
 }
 
 // canRelayMsg returns whether we are able to relay for one of the topics
@@ -850,12 +888,10 @@ func (p *PubSub) canRelayMsg(msg *pb.Message) bool {
 		return false
 	}
 
-	for _, t := range msg.GetTopicIDs() {
-		if relays := p.myRelays[t]; relays != 0 {
-			return true
-		}
-	}
-	return false
+	topic := msg.GetTopic()
+	relays := p.myRelays[topic]
+
+	return relays > 0
 }
 
 func (p *PubSub) notifyLeave(topic string, pid peer.ID) {
@@ -867,8 +903,19 @@ func (p *PubSub) notifyLeave(topic string, pid peer.ID) {
 func (p *PubSub) handleIncomingRPC(rpc *RPC) {
 	p.tracer.RecvRPC(rpc)
 
-	for _, subopt := range rpc.GetSubscriptions() {
+	subs := rpc.GetSubscriptions()
+	if len(subs) != 0 && p.subFilter != nil {
+		var err error
+		subs, err = p.subFilter.FilterIncomingSubscriptions(rpc.from, subs)
+		if err != nil {
+			log.Debugf("subscription filter error: %s; ignoring RPC", err)
+			return
+		}
+	}
+
+	for _, subopt := range subs {
 		t := subopt.GetTopicid()
+
 		if subopt.GetSubscribe() {
 			tmap, ok := p.topics[t]
 			if !ok {
@@ -897,19 +944,27 @@ func (p *PubSub) handleIncomingRPC(rpc *RPC) {
 	}
 
 	// ask the router to vet the peer before commiting any processing resources
-	if !p.rt.AcceptFrom(rpc.from) {
-		log.Infof("received message from router graylisted peer %s. Dropping RPC", rpc.from)
+	switch p.rt.AcceptFrom(rpc.from) {
+	case AcceptNone:
+		log.Debugf("received RPC from router graylisted peer %s; dropping RPC", rpc.from)
 		return
-	}
 
-	for _, pmsg := range rpc.GetPublish() {
-		if !(p.subscribedToMsg(pmsg) || p.canRelayMsg(pmsg)) {
-			log.Warn("received message we didn't subscribe to. Dropping.")
-			continue
+	case AcceptControl:
+		if len(rpc.GetPublish()) > 0 {
+			log.Debugf("peer %s was throttled by router; ignoring %d payload messages", rpc.from, len(rpc.GetPublish()))
 		}
+		p.tracer.ThrottlePeer(rpc.from)
 
-		msg := &Message{pmsg, rpc.from, nil}
-		p.pushMsg(msg)
+	case AcceptAll:
+		for _, pmsg := range rpc.GetPublish() {
+			if !(p.subscribedToMsg(pmsg) || p.canRelayMsg(pmsg)) {
+				log.Debug("received message in topic we didn't subscribe to; ignoring message")
+				continue
+			}
+
+			msg := &Message{pmsg, rpc.from, nil}
+			p.pushMsg(msg)
+		}
 	}
 
 	p.rt.HandleRPC(rpc)
@@ -925,23 +980,47 @@ func (p *PubSub) pushMsg(msg *Message) {
 	src := msg.ReceivedFrom
 	// reject messages from blacklisted peers
 	if p.blacklist.Contains(src) {
-		log.Warnf("dropping message from blacklisted peer %s", src)
+		log.Debugf("dropping message from blacklisted peer %s", src)
 		p.tracer.RejectMessage(msg, rejectBlacklstedPeer)
 		return
 	}
 
 	// even if they are forwarded by good peers
 	if p.blacklist.Contains(msg.GetFrom()) {
-		log.Warnf("dropping message from blacklisted source %s", src)
+		log.Debugf("dropping message from blacklisted source %s", src)
 		p.tracer.RejectMessage(msg, rejectBlacklistedSource)
 		return
 	}
 
 	// reject unsigned messages when strict before we even process the id
-	if p.signStrict && msg.Signature == nil {
-		log.Debugf("dropping unsigned message from %s", src)
-		p.tracer.RejectMessage(msg, rejectMissingSignature)
-		return
+	if p.signPolicy.mustVerify() {
+		if p.signPolicy.mustSign() {
+			if msg.Signature == nil {
+				log.Debugf("dropping unsigned message from %s", src)
+				p.tracer.RejectMessage(msg, rejectMissingSignature)
+				return
+			}
+			// Actual signature verification happens in the validation pipeline,
+			// after checking if the message was already seen or not,
+			// to avoid unnecessary signature verification processing-cost.
+		} else {
+			if msg.Signature != nil {
+				log.Debugf("dropping message with unexpected signature from %s", src)
+				p.tracer.RejectMessage(msg, rejectUnexpectedSignature)
+				return
+			}
+			// If we are expecting signed messages, and not authoring messages,
+			// then do no accept seq numbers, from data, or key data.
+			// The default msgID function still relies on Seqno and From,
+			// but is not used if we are not authoring messages ourselves.
+			if p.signID == "" {
+				if msg.Seqno != nil || msg.From != nil || msg.Key != nil {
+					log.Debugf("dropping message with unexpected auth info from %s", src)
+					p.tracer.RejectMessage(msg, rejectUnexpectedAuthInfo)
+					return
+				}
+			}
+		}
 	}
 
 	// reject messages claiming to be from ourselves but not locally published
@@ -1008,6 +1087,10 @@ func (p *PubSub) Join(topic string, opts ...TopicOpt) (*Topic, error) {
 // Returns true if the topic was newly created, false otherwise
 // Can be removed once pubsub.Publish() and pubsub.Subscribe() are removed
 func (p *PubSub) tryJoin(topic string, opts ...TopicOpt) (*Topic, bool, error) {
+	if p.subFilter != nil && !p.subFilter.CanSubscribe(topic) {
+		return nil, false, fmt.Errorf("topic is not allowed by the subscription filter")
+	}
+
 	t := &Topic{
 		p:           p,
 		topic:       topic,

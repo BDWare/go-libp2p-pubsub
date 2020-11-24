@@ -8,13 +8,15 @@ import (
 	"testing"
 	"time"
 
-	pb "github.com/bdware/go-libp2p-pubsub/pb"
-	ggio "github.com/gogo/protobuf/io"
-	logging "github.com/ipfs/go-log"
 	"github.com/libp2p/go-libp2p-core/host"
 	"github.com/libp2p/go-libp2p-core/network"
 	"github.com/libp2p/go-libp2p-core/peer"
 	"github.com/libp2p/go-libp2p-core/protocol"
+
+	pb "github.com/bdware/go-libp2p-pubsub/pb"
+
+	logging "github.com/ipfs/go-log"
+	"github.com/libp2p/go-msgio/protoio"
 )
 
 // Test that when Gossipsub receives too many IWANT messages from a peer
@@ -660,10 +662,10 @@ func TestGossipsubAttackInvalidMessageSpam(t *testing.T) {
 					// fail validation and reduce the attacker's score)
 					for i := 0; i < 100; i++ {
 						msg := &pb.Message{
-							Data:     []byte("some data" + strconv.Itoa(i)),
-							TopicIDs: []string{mytopic},
-							From:     []byte(attacker.ID()),
-							Seqno:    []byte{byte(i + 1)},
+							Data:  []byte("some data" + strconv.Itoa(i)),
+							Topic: &mytopic,
+							From:  []byte(attacker.ID()),
+							Seqno: []byte{byte(i + 1)},
 						}
 						writeMsg(&pb.RPC{
 							Publish: []*pb.Message{msg},
@@ -718,8 +720,8 @@ func newMockGS(ctx context.Context, t *testing.T, attacker host.Host, onReadMsg 
 			t.Fatal(err)
 		}
 
-		r := ggio.NewDelimitedReader(stream, maxMessageSize)
-		w := ggio.NewDelimitedWriter(ostream)
+		r := protoio.NewDelimitedReader(stream, maxMessageSize)
+		w := protoio.NewDelimitedWriter(ostream)
 
 		var irpc pb.RPC
 

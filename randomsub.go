@@ -102,8 +102,8 @@ func (rs *RandomSubRouter) EnoughPeers(topic string, suggested int) bool {
 	return false
 }
 
-func (rs *RandomSubRouter) AcceptFrom(peer.ID) bool {
-	return true
+func (rs *RandomSubRouter) AcceptFrom(peer.ID) AcceptStatus {
+	return AcceptAll
 }
 
 func (rs *RandomSubRouter) HandleRPC(rpc *RPC) {}
@@ -115,22 +115,21 @@ func (rs *RandomSubRouter) Publish(msg *Message) {
 	rspeers := make(map[peer.ID]struct{})
 	src := peer.ID(msg.GetFrom())
 
-	for _, topic := range msg.GetTopicIDs() {
-		tmap, ok := rs.p.topics[topic]
-		if !ok {
+	topic := msg.GetTopic()
+	tmap, ok := rs.p.topics[topic]
+	if !ok {
+		return
+	}
+
+	for p := range tmap {
+		if p == from || p == src {
 			continue
 		}
 
-		for p := range tmap {
-			if p == from || p == src {
-				continue
-			}
-
-			if rs.peers[p] == FloodSubID {
-				tosend[p] = struct{}{}
-			} else {
-				rspeers[p] = struct{}{}
-			}
+		if rs.peers[p] == FloodSubID {
+			tosend[p] = struct{}{}
+		} else {
+			rspeers[p] = struct{}{}
 		}
 	}
 

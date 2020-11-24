@@ -11,14 +11,13 @@ import (
 
 	pb "github.com/bdware/go-libp2p-pubsub/pb"
 
-	"github.com/libp2p/go-libp2p-core/helpers"
 	"github.com/libp2p/go-libp2p-core/host"
 	"github.com/libp2p/go-libp2p-core/network"
 	"github.com/libp2p/go-libp2p-core/peer"
 	"github.com/libp2p/go-libp2p-core/peerstore"
 	"github.com/libp2p/go-libp2p-core/protocol"
 
-	ggio "github.com/gogo/protobuf/io"
+	"github.com/libp2p/go-msgio/protoio"
 )
 
 var TraceBufferSize = 1 << 16 // 64K ought to be enough for everyone; famous last words.
@@ -29,6 +28,8 @@ const (
 	rejectBlacklstedPeer      = "blacklisted peer"
 	rejectBlacklistedSource   = "blacklisted source"
 	rejectMissingSignature    = "missing signature"
+	rejectUnexpectedSignature = "unexpected signature"
+	rejectUnexpectedAuthInfo  = "unexpected auth info"
 	rejectInvalidSignature    = "invalid signature"
 	rejectValidationQueueFull = "validation queue full"
 	rejectValidationThrottled = "validation throttled"
@@ -54,7 +55,7 @@ func (t *basicTracer) Trace(evt *pb.TraceEvent) {
 	}
 
 	if t.lossy && len(t.buf) > TraceBufferSize {
-		log.Warnf("trace buffer overflow; dropping trace event")
+		log.Debug("trace buffer overflow; dropping trace event")
 	} else {
 		t.buf = append(t.buf, evt)
 	}
@@ -152,7 +153,7 @@ func OpenPBTracer(file string, flags int, perm os.FileMode) (*PBTracer, error) {
 
 func (t *PBTracer) doWrite() {
 	var buf []*pb.TraceEvent
-	w := ggio.NewDelimitedWriter(t.w)
+	w := protoio.NewDelimitedWriter(t.w)
 	for {
 		_, ok := <-t.ch
 
@@ -202,14 +203,14 @@ func (t *RemoteTracer) doWrite() {
 
 	s, err := t.openStream()
 	if err != nil {
-		log.Warnf("error opening remote tracer stream: %s", err.Error())
+		log.Debugf("error opening remote tracer stream: %s", err.Error())
 		return
 	}
 
 	var batch pb.TraceEventBatch
 
 	gzipW := gzip.NewWriter(s)
-	w := ggio.NewDelimitedWriter(gzipW)
+	w := protoio.NewDelimitedWriter(gzipW)
 
 	for {
 		_, ok := <-t.ch
@@ -237,13 +238,13 @@ func (t *RemoteTracer) doWrite() {
 
 		err = w.WriteMsg(&batch)
 		if err != nil {
-			log.Warnf("error writing trace event batch: %s", err)
+			log.Debugf("error writing trace event batch: %s", err)
 			goto end
 		}
 
 		err = gzipW.Flush()
 		if err != nil {
-			log.Warnf("error flushin gzip stream: %s", err)
+			log.Debugf("error flushin gzip stream: %s", err)
 			goto end
 		}
 
@@ -258,7 +259,7 @@ func (t *RemoteTracer) doWrite() {
 				s.Reset()
 			} else {
 				gzipW.Close()
-				helpers.FullClose(s)
+				s.Close()
 			}
 			return
 		}
@@ -267,7 +268,7 @@ func (t *RemoteTracer) doWrite() {
 			s.Reset()
 			s, err = t.openStream()
 			if err != nil {
-				log.Warnf("error opening remote tracer stream: %s", err.Error())
+				log.Debugf("error opening remote tracer stream: %s", err.Error())
 				return
 			}
 
