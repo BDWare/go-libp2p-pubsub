@@ -286,11 +286,22 @@ func NewPubSub(ctx context.Context, h host.Host, rt PubSubRouter, opts ...Option
 	for _, id := range rt.Protocols() {
 		h.SetStreamHandler(id, ps.handleNewStream)
 	}
+
 	h.Network().Notify((*PubSubNotif)(ps))
 
 	ps.val.Start(ps)
 
 	go ps.processLoop(ctx)
+
+	// replay the peers connected to pubsub via Notif
+	go func() {
+		for _, pid := range h.Network().Peers() {
+			select {
+			case ps.newPeers <- pid:
+			case <-ps.ctx.Done():
+			}
+		}
+	}()
 
 	return ps, nil
 }
