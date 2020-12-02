@@ -349,6 +349,9 @@ type GossipSubRouter struct {
 	tagTracer    *tagTracer
 	gate         *peerGater
 
+	// customProtocols are the protocols specialized for go-libp2p-collect.
+	customProtocols []protocol.ID
+
 	// whether PX is enabled; this should be enabled in bootstrappers and other well connected/trusted
 	// nodes.
 	doPX bool
@@ -399,7 +402,10 @@ type connectInfo struct {
 }
 
 func (gs *GossipSubRouter) Protocols() []protocol.ID {
-	return []protocol.ID{GossipSubID_v11, GossipSubID_v10, FloodSubID}
+	if len(gs.customProtocols) == 0 {
+		return []protocol.ID{GossipSubID_v11, GossipSubID_v10, FloodSubID}
+	}
+	return gs.customProtocols
 }
 
 func (gs *GossipSubRouter) Attach(p *PubSub) {
@@ -1609,7 +1615,7 @@ func (gs *GossipSubRouter) emitGossip(topic string, exclude map[peer.ID]struct{}
 	for p := range gs.p.topics[topic] {
 		_, inExclude := exclude[p]
 		_, direct := gs.direct[p]
-		if !inExclude && !direct && (gs.peers[p] == GossipSubID_v10 || gs.peers[p] == GossipSubID_v11) && gs.score.Score(p) >= gs.gossipThreshold {
+		if !inExclude && !direct && (gs.peers[p] == GossipSubID_v10 || gs.peers[p] == GossipSubID_v11 || gs.supportCustomProtocols(gs.peers[p])) && gs.score.Score(p) >= gs.gossipThreshold {
 			peers = append(peers, p)
 		}
 	}
@@ -1777,7 +1783,7 @@ func (gs *GossipSubRouter) getPeers(topic string, count int, filter func(peer.ID
 
 	peers := make([]peer.ID, 0, len(tmap))
 	for p := range tmap {
-		if (gs.peers[p] == GossipSubID_v10 || gs.peers[p] == GossipSubID_v11) && filter(p) {
+		if (gs.peers[p] == GossipSubID_v10 || gs.peers[p] == GossipSubID_v11 || gs.supportCustomProtocols(gs.peers[p])) && filter(p) {
 			peers = append(peers, p)
 		}
 	}
@@ -1789,6 +1795,15 @@ func (gs *GossipSubRouter) getPeers(topic string, count int, filter func(peer.ID
 	}
 
 	return peers
+}
+
+func (gs *GossipSubRouter) supportCustomProtocols(prot protocol.ID) bool {
+	for _, p := range gs.customProtocols {
+		if p == prot {
+			return true
+		}
+	}
+	return false
 }
 
 func peerListToMap(peers []peer.ID) map[peer.ID]struct{} {

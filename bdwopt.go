@@ -34,19 +34,23 @@ func WithRandomSubDGenerator(gen RandomSubDGenerator) Option {
 	}
 }
 
-// WithCustomProtocols changes the protocols of randomsub.
+// WithCustomProtocols changes the protocols of pubsub.
 func WithCustomProtocols(protos []protocol.ID) Option {
 	return func(p *PubSub) error {
-		rt, ok := p.rt.(*RandomSubRouter)
-		// check rt's type
-		if !ok {
-			return fmt.Errorf("unexpected router type: need to be RandomSub")
-		}
 		if len(protos) == 0 {
 			return fmt.Errorf("unexpected empty protos")
 		}
-		// change rt's generator
-		rt.protocols = protos
+		switch rt := p.rt.(type) {
+		case *RandomSubRouter:
+			rt.protocols = protos
+		case *FloodSubRouter:
+			rt.protocols = protos
+		case *GossipSubRouter:
+			rt.customProtocols = protos
+		default:
+			return fmt.Errorf("unknown router type")
+		}
+
 		return nil
 	}
 }
