@@ -4,7 +4,7 @@ import (
 	"testing"
 
 	pb "github.com/bdware/go-libp2p-pubsub/pb"
-	compat_pb "github.com/libp2p/go-libp2p-pubsub/compat"
+	compat_pb "github.com/bdware/go-libp2p-pubsub/compat"
 )
 
 func TestMultitopicMessageCompatibility(t *testing.T) {
