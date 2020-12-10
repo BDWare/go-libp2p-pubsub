@@ -55,14 +55,13 @@ func TestBasicJoinAndLeave(t *testing.T) {
 	})
 }
 
-func TestSendRecv(t *testing.T) {
+func testSendRecv(t *testing.T, data []byte) {
 	hosts := getNetHosts(t, context.Background(), 2)
 	connectAll(t, hosts)
 	h1, h2 := hosts[0], hosts[1]
 	tbo1 := mustNewTopicWires(h1)
 	tbo2 := mustNewTopicWires(h2)
 	topic := "test"
-	data := []byte("hello")
 	okCH := make(chan struct{}, 1)
 	tbo2.SetTopicMsgHandler(func(top string, from peer.ID, dat []byte) {
 		assert.Equal(t, topic, top)
@@ -77,8 +76,17 @@ func TestSendRecv(t *testing.T) {
 	assert.NoError(t, err)
 	select {
 	case <-okCH:
-	case <-time.After(1 * time.Second):
+	case <-time.After(2 * time.Second):
 		t.Fatal("cannot receive msg")
 	}
 
+}
+
+func TestSendRecv(t *testing.T) {
+	testSendRecv(t, []byte("hello"))
+}
+
+func TestSendRecvBig(t *testing.T) {
+	// logging.SetLogLevel("pubsub", "debug")
+	testSendRecv(t, make([]byte, 2000000)) //2M
 }

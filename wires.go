@@ -69,11 +69,22 @@ type PubSubTopicWires struct {
 	topics   map[string]*topicElement
 }
 
-func NewPubSubTopicWires(h host.Host) (*PubSubTopicWires, error) {
+func NewPubSubTopicWires(h host.Host, opts ...Option) (*PubSubTopicWires, error) {
 	rt := &PubSubTopicWiresRouter{
 		protocols: []protocol.ID{protocol.ID("/topic-wires/1.0.0")},
 	}
-	psub, err := NewPubSub(context.Background(), h, rt)
+	// Set the default message size.
+	// As we using the pubsub system to build a topic overlay protocol, the default
+	// message size is too small for response.
+	// We have already considered the warning written in pubsub.go:450.
+	// First, we have our own protocols to send and receive messages;
+	// Second, the write-amplipfy phenomenon can be alleviated by sending lightweighted
+	// requests and answering the only one primary node.
+	// However, we still need a machinism to support download resume.
+	opts = append([]Option{WithMaxMessageSize(10 * 1024 * 1024)}, opts...) // 10M
+	psub, err := NewPubSub(context.Background(), h, rt,
+		opts...,
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -171,6 +182,7 @@ func (w *PubSubTopicWires) SetListener(l TopicWireListener) {
 	w.listener = l
 }
 func (w *PubSubTopicWires) SendMsg(topic string, to peer.ID, data []byte) error {
+	// fmt.Printf("%s send to %s with topic %s\n", w.ID().ShortString(), to.ShortString(), topic)
 	errCh := make(chan error, 1)
 	w.psub.eval <- func() {
 		capTopic := topic
