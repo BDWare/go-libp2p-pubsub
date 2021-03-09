@@ -46,11 +46,9 @@ func (r *PubSubTopicWiresRouter) RemovePeer(peer.ID)                           {
 func (r *PubSubTopicWiresRouter) EnoughPeers(topic string, suggested int) bool { return true }
 func (r *PubSubTopicWiresRouter) AcceptFrom(peer.ID) AcceptStatus              { return AcceptAll }
 func (r *PubSubTopicWiresRouter) HandleRPC(rpc *RPC)                           {}
-func (r *PubSubTopicWiresRouter) Publish(msg *Message) {
-	r.wires.handleMsg(msg)
-}
-func (r *PubSubTopicWiresRouter) Join(topic string)  {}
-func (r *PubSubTopicWiresRouter) Leave(topic string) {}
+func (r *PubSubTopicWiresRouter) Publish(msg *Message)                         {}
+func (r *PubSubTopicWiresRouter) Join(topic string)                            {}
+func (r *PubSubTopicWiresRouter) Leave(topic string)                           {}
 
 /*===========================================================================*/
 
@@ -144,6 +142,15 @@ func (w *PubSubTopicWires) Join(topic string) error {
 			}
 		}
 	}(cctx, w.listener)
+	go func(ctx context.Context) {
+		for {
+			msg, err := sub.Next(ctx)
+			if err != nil {
+				return
+			}
+			w.handleMsg(msg)
+		}
+	}(cctx)
 	return nil
 }
 func (w *PubSubTopicWires) Leave(topic string) error {
